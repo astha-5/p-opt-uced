@@ -588,127 +588,74 @@ function dispatch96(plants, peakMW, mi, stoa, mkt, fdreList, scenarioMult = {}, 
         mktExpensive: arbViable && mktPrice >= priceP75 };
     });
 
-    // Discharge candidates: (P0) deficit blocks by deficit desc, (P1) expensive-market blocks by price desc
-    const dischargeCands = [
-      ...blockClass.filter(b => b.isDeficit).sort((a, b) => b.deficitMW - a.deficitMW),
-      ...blockClass.filter(b => !b.isDeficit && b.mktExpensive).sort((a, b) => b.mktPrice - a.mktPrice)
-    ];
-    // Charge candidates: (P0) surplus blocks by surplus desc, (P1) cheap-market blocks by price asc
-    const chargeCands = [
-      ...blockClass.filter(b => b.isSurplus).sort((a, b) => b.surplusMW - a.surplusMW),
-      ...blockClass.filter(b => !b.isSurplus && b.mktCheap).sort((a, b) => a.mktPrice - b.mktPrice)
-    ];
-
+    // ── CHRONOLOGICAL SCHEDULER (v5.8, fixes audit P2-9) ──
+    // Walk the day in TIME order with live SoC, so charge→discharge sequences within a
+    // day actually work (the old priority-ordered Phases A/B capped daily discharge near
+    // the INITIAL stored energy and only charged "what discharge needed" — a BESS could
+    // charge once and never discharge, while curtailed energy went unabsorbed).
+    // Behaviour per block, in priority order:
+    //   discharge into physical deficit → charge from physical surplus (CURTAILMENT-FIRST:
+    //   that energy is otherwise spilled, i.e. free) → discharge into expensive-arb blocks
+    //   → charge from cheap-arb blocks. Ramps, charge↔discharge transition cooldown, SoC
+    //   band and daily cycle budget enforced inline.
     const schedule = Array(96).fill(0); // MW at each block (+discharge, -charge)
     let soc = (socMaxPct + socMinPct) / 2; // start at mid-SoC
     let cycleUsed = 0; // MWh discharged
-
-    // Phase A: Schedule discharges — fill deficit first, then sell to expensive market
-    dischargeCands.forEach(({ t, deficitMW, isDeficit }) => {
-      if (cycleUsed >= cycleBudgetMWh) return;
-      const availEnergy = (soc - socMinPct) / 100 * cap;
-      if (availEnergy < maxDischargeRate * 0.25 * 0.5) return;
-      const maxByCycle = (cycleBudgetMWh - cycleUsed) / 0.25;
-      const maxBySOC = availEnergy / 0.25;
-      // Deficit blocks: cap at deficit MW (or pMax if deficit is huge); market blocks: full capacity
-      const capByNeed = isDeficit ? Math.min(deficitMW, maxDischargeRate) : maxDischargeRate;
-      const dp = Math.round(Math.min(maxDischargeRate, capByNeed, maxBySOC, maxByCycle));
-      if (dp > 0) {
-        schedule[t] = dp;
-        soc -= (dp * 0.25 / cap) * 100;
-        cycleUsed += dp * 0.25;
-      }
-    });
-
-    // Phase B: Schedule charges — absorb surplus first, then buy cheap market
-    const totalDischargeMWh = cycleUsed;
-    let chargeNeeded = totalDischargeMWh / eff; // MWh to pump in (accounting for efficiency)
-    const startSoC = (socMaxPct + socMinPct) / 2;
-    const socDeficit = (startSoC - soc) / 100 * cap;
-    if (socDeficit > 0) chargeNeeded = Math.max(chargeNeeded, socDeficit / eff);
-
-    let socForCharge = soc;
-    chargeCands.forEach(({ t, surplusMW, isSurplus }) => {
-      if (chargeNeeded <= 0) return;
-      if (schedule[t] !== 0) return; // already scheduled for discharge
-      const roomMWh = (socMaxPct - socForCharge) / 100 * cap;
-      if (roomMWh < maxChargeRate * 0.25 * eff * 0.3) return;
-      const maxByRoom = roomMWh / (0.25 * eff);
-      // Surplus blocks: cap at available surplus MW (absorb what's there)
-      const capBySurplus = isSurplus ? Math.min(maxChargeRate, surplusMW) : maxChargeRate;
-      const ch = Math.round(Math.min(capBySurplus, maxByRoom, chargeNeeded / 0.25));
-      if (ch > 0) {
-        schedule[t] = -ch;
-        socForCharge += (ch * 0.25 * eff / cap) * 100;
-        chargeNeeded -= ch * 0.25;
-      }
-    });
-
-    // Phase C: Apply ramp and transition constraints (sequential smoothing)
-    const smoothed = Array(96).fill(0);
-    let prevPower = 0; // MW from previous block (signed: +discharge, -charge)
-    let prevState = "IDLE"; // "CHARGING", "DISCHARGING", "IDLE"
-    let transCountdown = 0; // blocks remaining in transition cooldown
+    let prevPower = 0, prevState = "IDLE", transCountdown = 0;
 
     for (let t = 0; t < 96; t++) {
-      let target = schedule[t];
-      const targetState = target > 0 ? "DISCHARGING" : target < 0 ? "CHARGING" : "IDLE";
+      if (transCountdown > 0) { transCountdown--; prevPower = 0; prevState = "IDLE"; continue; }
+      const bc = blockClass[t];
+      const canDis = soc > socMinPct + 0.01 && cycleUsed < cycleBudgetMWh - 0.01;
+      const canChg = soc < socMaxPct - 0.01;
 
-      // Transition enforcement: if switching charge↔discharge, enforce cooldown
-      if (transCountdown > 0) {
-        smoothed[t] = 0;
-        transCountdown--;
-        prevPower = 0;
-        prevState = "IDLE";
+      // Priority: real deficit → price-expensive (discharge displaces surplus sales at the
+      // HIGH price, so it beats absorbing surplus in the same block — in all-surplus months
+      // the reverse ordering charges forever and never discharges) → physical surplus → cheap.
+      let target = 0;
+      if (bc.isDeficit && canDis) target = Math.min(maxDischargeRate, Math.max(1, bc.deficitMW));
+      else if (bc.mktExpensive && canDis) target = maxDischargeRate;
+      else if (bc.isSurplus && canChg) target = -Math.min(maxChargeRate, Math.max(1, bc.surplusMW));
+      else if (bc.mktCheap && canChg) target = -maxChargeRate;
+      if (target === 0) { prevPower = 0; prevState = prevState; schedule[t] = 0; continue; }
+
+      // Charge↔discharge transition cooldown
+      const st = target > 0 ? "DISCHARGING" : "CHARGING";
+      if (prevState !== "IDLE" && st !== prevState) {
+        transCountdown = transBlocks;
+        prevPower = 0; prevState = "IDLE";
         continue;
       }
-      if (targetState !== "IDLE" && prevState !== "IDLE" && targetState !== prevState) {
-        // State transition — this block is idle, then transBlocks more idle blocks
-        transCountdown = transBlocks; // e.g. PSP 15min = 1 block cooldown AFTER this idle block
-        smoothed[t] = 0;
-        prevPower = 0;
-        prevState = "IDLE";
-        continue;
-      }
 
-      // Ramp constraint (both ramp-up and ramp-down)
+      // Ramp-up limit vs previous block (same-direction magnitude)
       if (target > 0) {
-        // Discharging — ramp up limit
-        const maxUp = prevPower >= 0 ? prevPower + rampUpMW : rampUpMW;
-        target = Math.min(target, Math.max(0, maxUp));
-        // Ramp down limit: can't drop too fast from previous discharge
-        if (prevPower > 0) {
-          const minDn = prevPower - rampDnMW;
-          if (target < minDn && minDn > 0) target = Math.max(target, minDn);
-        }
-      } else if (target < 0) {
-        // Charging ramp (target is negative, ramp in absolute terms)
-        const absTarget = Math.abs(target);
-        const absPrev = prevPower <= 0 ? Math.abs(prevPower) : 0;
-        const maxUp = absPrev + rampUpMW;
-        target = -Math.min(absTarget, maxUp);
-        // Ramp down limit for charge: can't reduce charge rate too fast
-        if (prevPower < 0) {
-          const minDn = Math.abs(prevPower) - rampDnMW;
-          if (absTarget < minDn && minDn > 0) target = -Math.max(absTarget, minDn);
-        }
-      } else if (target === 0 && prevPower !== 0) {
-        // Transitioning to idle — enforce ramp down from previous state
-        if (prevPower > 0) {
-          const minOut = prevPower - rampDnMW;
-          if (minOut > 0) target = Math.round(minOut); // can't go to 0 instantly
-        } else if (prevPower < 0) {
-          const minCh = Math.abs(prevPower) - rampDnMW;
-          if (minCh > 0) target = -Math.round(minCh);
-        }
+        const base = prevPower > 0 ? prevPower : 0;
+        target = Math.min(target, base + rampUpMW);
+      } else {
+        const base = prevPower < 0 ? -prevPower : 0;
+        target = -Math.min(-target, base + rampUpMW);
       }
 
-      smoothed[t] = Math.round(target);
-      prevPower = smoothed[t];
-      prevState = smoothed[t] > 0 ? "DISCHARGING" : smoothed[t] < 0 ? "CHARGING" : prevState;
+      // SoC / cycle-budget caps, then commit
+      if (target > 0) {
+        const maxBySOC = (soc - socMinPct) / 100 * cap / 0.25;
+        const maxByCycle = (cycleBudgetMWh - cycleUsed) / 0.25;
+        target = Math.floor(Math.min(target, maxBySOC, maxByCycle));
+        if (target > 0) { soc -= (target * 0.25 / cap) * 100; cycleUsed += target * 0.25; }
+        else target = 0;
+      } else {
+        const maxByRoom = (socMaxPct - soc) / 100 * cap / (0.25 * eff);
+        target = -Math.floor(Math.min(-target, maxByRoom));
+        if (target < 0) soc += ((-target) * 0.25 * eff / cap) * 100;
+        else target = 0;
+      }
+
+      schedule[t] = target;
+      prevPower = target;
+      prevState = target > 0 ? "DISCHARGING" : target < 0 ? "CHARGING" : prevState;
     }
 
-    storSchedule[p.id] = smoothed;
+    storSchedule[p.id] = schedule;
   });
 
   // ════════════════════════════════════════════════════════════
@@ -829,17 +776,21 @@ function dispatch96(plants, peakMW, mi, stoa, mkt, fdreList, scenarioMult = {}, 
           // (avoids unrealistic instant shutdown of running units)
           if (avX > 0 && commitState[p.id].on > 0 && prevMW[p.id] > 0) {
             const maxDn = (p.rampDn || p.rampUp || 999) * 15;
-            const canReach = Math.max(0, prevMW[p.id] - maxDn);
-            if (canReach > 0) {
-              // Still ramping down — output what ramp rate allows
-              const dp = Math.min(avX, Math.max(p.pMin, Math.round(canReach)));
+            const pMinEffX = Math.min(p.pMin, avX);
+            if (prevMW[p.id] > pMinEffX + 1) {
+              // Still above technical minimum — ramp down toward the floor
+              const dp = Math.min(avX, Math.max(pMinEffX, Math.round(prevMW[p.id] - maxDn)));
               src[p.id] = { id: p.id, n: p.name, tp: p.type, mw: dp, ecr: p.ecr * fuelMult, st: "RAMP-DN", fuel: p.fuel || "none" };
               rem -= dp; gen += dp;
               commitState[p.id].on++;
               prevMW[p.id] = dp;
               return;
             }
-            // canReach ≤ 0 means ramp rate allows full shutdown — proceed to standby
+            // At (or within 1 MW of) technical minimum and past minUp: pMin→0 is the
+            // decommit step, not a ramp violation — fall through to shutdown.
+            // (Old logic floored RAMP-DN at pMin and only shut down when the ramp alone
+            // reached 0, so any unit with pMin > rampDn×15 could NEVER decommit — e.g.
+            // CCGT_CC pMin 105 vs 37.5 MW/block ran 24×7 at ₹5.41 once committed.)
           }
           src[p.id] = { id: p.id, n: p.name, tp: p.type, mw: 0, ecr: p.ecr * fuelMult, st: "STANDBY", fuel: p.fuel || "none" };
           if (commitState[p.id].on > 0) { commitState[p.id].on = 0; commitState[p.id].off = 0; }
@@ -939,6 +890,12 @@ function dispatch96(plants, peakMW, mi, stoa, mkt, fdreList, scenarioMult = {}, 
     blks.push({
       t, lbl: TB[t].lbl, dem: d, src, gen, chg: chargingLoad,
       def: deficit, sur: surplus, unserved, curtailment: Math.round(curtailment),
+      // Structural self-sufficiency gap BEFORE market & storage: full own capability
+      // (must-run + FLOOR-derated thermal headroom) + contracts − demand.
+      // Negative = must procure regardless of price. `def` above ALSO contains
+      // discretionary ECONOMY purchases (market bought because it beat own VC),
+      // so def is NOT a shortfall measure — selfGap is.
+      selfGap: Math.round(totalThermalCap - netResidual[t]),
       fdreMW, fdreRate: fdreAvgRate,
       stoaBuy: stoaUsed, stoaSell: actualStoaSell, stoaRate: stoaAvgRate,
       mkt: mktTotal, mktDAM, mktGDAM: mktGDAM || 0, mktRTM, mktSell: surplus,
@@ -2118,9 +2075,16 @@ function PriceChart({ data, res }) {
     if (!data || !data.length) return [];
     const src = res === "15min" ? data : aggHourly(data);
     return src.map((b, i) => {
+      // ACTUAL system marginal (audit N2 fix): costliest OWN unit dispatched this block,
+      // or the costliest market segment actually bought — whichever is higher.
+      // (Previously used the Pass-1 estimate, which pins to the CCGT ECR step for most
+      // residual levels with the BRPL portfolio → the flat ₹5.41 line.)
       const dispatched = b.src ? Object.values(b.src).filter(s => s.mw > 0 && s.ecr > 0) : [];
-      const margCost = dispatched.length > 0 ? Math.max(...dispatched.map(s => s.ecr)) : 0;
-      return { lbl: res === "15min" ? (TB[i] ? TB[i].lbl : i) : `${String(b.h != null ? b.h : i).padStart(2, "0")}:00`, dam: b.damRate || 0, rtm: b.rtmRate || 0, gdam: b.gdamRate || 0, marginal: margCost };
+      let marg = dispatched.length > 0 ? Math.max(...dispatched.map(s => s.ecr)) : 0;
+      if ((b.mktDAM || 0) > 0) marg = Math.max(marg, b.damRate || 0);
+      if ((b.mktGDAM || 0) > 0) marg = Math.max(marg, b.gdamRate || 0);
+      if ((b.mktRTM || 0) > 0) marg = Math.max(marg, b.rtmRate || 0);
+      return { lbl: res === "15min" ? (TB[i] ? TB[i].lbl : i) : `${String(b.h != null ? b.h : i).padStart(2, "0")}:00`, dam: b.damRate || 0, rtm: b.rtmRate || 0, gdam: b.gdamRate || 0, marginal: +marg.toFixed(2) };
     });
   }, [data, res]);
   return (
@@ -2355,7 +2319,15 @@ function MeritOrderChart({ data, plants, days }) {
 function PriceDurationCurve({ data }) {
   const cd = useMemo(() => {
     if (!data || !data.length) return [];
-    const prices = data.map(b => b.margCost || 0).sort((a, b) => b - a);
+    // Same ACTUAL-marginal definition as PriceChart (own dispatched max ECR vs bought segments)
+    const prices = data.map(b => {
+      const dispatched = b.src ? Object.values(b.src).filter(s => s.mw > 0 && s.ecr > 0) : [];
+      let m = dispatched.length > 0 ? Math.max(...dispatched.map(s => s.ecr)) : 0;
+      if ((b.mktDAM || 0) > 0) m = Math.max(m, b.damRate || 0);
+      if ((b.mktGDAM || 0) > 0) m = Math.max(m, b.gdamRate || 0);
+      if ((b.mktRTM || 0) > 0) m = Math.max(m, b.rtmRate || 0);
+      return m;
+    }).sort((a, b) => b - a);
     return prices.map((p, i) => ({ pct: +((i / prices.length) * 100).toFixed(1), price: +p.toFixed(2) }));
   }, [data]);
   if (!cd.length) return null;
@@ -2467,7 +2439,7 @@ function NetPositionChart({ all }) {
       </ResponsiveContainer>
       <div style={{ display: "flex", gap: 16, justifyContent: "center", marginTop: 2 }}>
         <span style={{ ...mono, fontSize: 10, color: C.pos }}>▲ Surplus (sold) + curtailed</span>
-        <span style={{ ...mono, fontSize: 10, color: C.neg }}>▼ Deficit cover: market purchases + unserved</span>
+        <span style={{ ...mono, fontSize: 10, color: C.neg }}>▼ Market purchases (structural + economy buys) + unserved</span>
       </div>
     </div>
   );
@@ -2478,8 +2450,9 @@ function BalanceHeatmap({ all }) {
   const { grid, maxAbs } = useMemo(() => {
     const g = all.map(r => ({
       mo: r.mo,
-      // physical surplus = sold + curtailed (sur reports sold surplus only)
-      hours: Array.from({ length: 24 }, (_, h) => Math.round(safeMean(r.b96.slice(h * 4, h * 4 + 4), b => (b.sur || 0) + (b.curtailment || 0) - (b.def || 0)))),
+      // Structural gap (selfGap): own capability + contracts − demand, BEFORE market/storage.
+      // (Not sur−def: def includes discretionary economy purchases, which are not shortfall.)
+      hours: Array.from({ length: 24 }, (_, h) => Math.round(safeMean(r.b96.slice(h * 4, h * 4 + 4), b => b.selfGap ?? ((b.sur || 0) + (b.curtailment || 0) - (b.def || 0))))),
     }));
     return { grid: g, maxAbs: Math.max(1, ...g.flatMap(m => m.hours.map(Math.abs))) };
   }, [all]);
@@ -2983,7 +2956,7 @@ function HourlyDemandTable({ all }) {
 // Hourly supply-demand gap BEFORE market purchases (+surplus / −to-be-procured),
 // with band minima, market capability, maintenance MW, and monthly MU summary rows
 function HourlyGapTable({ all, plants, mkt }) {
-  const mtx = useMemo(() => hourlyMatrix(all, b => (b.sur || 0) + (b.curtailment || 0) - (b.def || 0)), [all]);
+  const mtx = useMemo(() => hourlyMatrix(all, b => b.selfGap ?? ((b.sur || 0) + (b.curtailment || 0) - (b.def || 0))), [all]);
   const maxAbs = Math.max(1, ...mtx.flatMap(m => m.hours.map(Math.abs)));
   const clr = v => v === 0 ? "transparent" : v > 0
     ? `rgba(0,230,118,${(0.08 + 0.38 * v / maxAbs).toFixed(2)})`
@@ -3004,7 +2977,7 @@ function HourlyGapTable({ all, plants, mkt }) {
   return (
     <div>
       <div style={{ ...mono, fontSize: 10, color: C.t3, marginBottom: 6 }}>
-        Gap = own generation + contracts − demand, BEFORE market purchases. <span style={{ color: C.neg }}>Negative (red)</span> = to be procured from market (up to Market Capability) — beyond that, unserved.
+        Gap = FULL own capability (must-run + available thermal headroom) + contracts − demand, before market &amp; storage. <span style={{ color: C.neg }}>Negative (red)</span> = structural shortfall — must be procured regardless of price (up to Market Capability; beyond that, unserved). Note: the dispatch may ALSO buy market in green hours when it is cheaper than own generation (economy purchase) — that is optimisation, not shortfall, and appears in the DAM/GDAM/RTM rows of the 96-Block page, not here.
       </div>
       <div style={{ overflow: "auto", border: `1px solid ${C.brd}`, borderRadius: 2, maxHeight: 520 }}>
         <table style={{ width: "100%", borderCollapse: "collapse" }}>
@@ -3825,7 +3798,7 @@ export default function App() {
           RPO {(rpoData.totMU > 0 ? rpoData.fulfilled?.total / rpoData.totMU * 100 : 0).toFixed(1)}%
         </span>
         <span style={{ ...mono, fontSize: 10, color: C.t2 }}>{R.mo} | Pk {R.pk}MW | Rs{R.agg.avgCost}/kWh</span>
-        <span style={{ ...lbl, fontSize: 10, color: C.t2, marginLeft: "auto" }}>P-OPT OUTLOOK v5.6 | {plants.length} UNITS | {scenarios.filter(s => s.active).length} SCENARIOS</span>
+        <span style={{ ...lbl, fontSize: 10, color: C.t2, marginLeft: "auto" }}>P-OPT OUTLOOK v5.9 | {plants.length} UNITS | {scenarios.filter(s => s.active).length} SCENARIOS</span>
       </div>
     </div>
   );
