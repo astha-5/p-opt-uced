@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, useRef } from "react";
+import { useState, useMemo, useCallback, useRef, useEffect } from "react";
 import * as XLSX from "xlsx";
 import {
   BarChart, Bar, LineChart, Line, AreaChart, Area, XAxis, YAxis,
@@ -21,6 +21,59 @@ const effAvail = (p, mi) => {
   const o = p.availMo ? p.availMo[mi] : null;
   const v = (o === "" || o == null) ? null : Number(o);
   return v != null && !isNaN(v) ? clamp(v, 0, 100) : (p.avail ?? 100);
+};
+
+// ══════════════════════════════════════════════════════════════
+//  DAILY BLOCK DATA HELPER
+//  Constructs a blockData-shaped object for a specific day.
+//  Priority: uploaded daily blocks > scaled monthly shape.
+// ══════════════════════════════════════════════════════════════
+const DAILY_SHEETS = [
+  { key: "demand", sheet: "Demand_Daily_Base_MW", alt: "Demand_Daily_MW", divisor: 1 },
+  { key: "demandHigh", sheet: "Demand_Daily_High_MW", divisor: 1 },
+  { key: "demandLow", sheet: "Demand_Daily_Low_MW", divisor: 1 },
+  { key: "dam", sheet: "DAM_Daily_Price_Rs_MWh", divisor: 1000 },
+  { key: "rtm", sheet: "RTM_Daily_Price_Rs_MWh", divisor: 1000 },
+  { key: "gdam", sheet: "GDAM_Daily_Price_Rs_MWh", divisor: 1000 },
+];
+
+// Scale a monthly 96-block shape by daily factors (weekday/weekend, day-of-month variation)
+const dailyScaleFactor = (dayOfMonth, dow, calMo) => {
+  const isWeekend = dow === 0 || dow === 6;
+  const isFriday = dow === 5;
+  // Weekend demand ~88%, Friday slightly lower ~96%
+  let factor = isWeekend ? 0.88 : (isFriday ? 0.96 : 1.0);
+  // Slight daily noise based on day number (deterministic)
+  factor += Math.sin(dayOfMonth * 2.71) * 0.02;
+  return factor;
+};
+
+// Build a dispatch96-compatible blockData for a single day.
+// daily96 = { demand: { "2026-07-01": [96], ... }, dam: {...}, ... } (daily upload)
+// monthly96 = uploaded96 (monthly reference)
+// dateStr = "YYYY-MM-DD", calMo = calendar month (0-11), dayOfMonth = 1-31, dow = 0-6
+const buildDailyBlockData = (daily96, monthly96, calMo, dateStr, dayOfMonth, dow) => {
+  const bd = {};
+  ["demand", "demandHigh", "demandLow", "dam", "rtm", "gdam"].forEach(key => {
+    // Priority 1: daily upload for this specific date
+    if (daily96 && daily96[key] && daily96[key][dateStr]) {
+      bd[key] = { [calMo]: daily96[key][dateStr] };
+      return;
+    }
+    // Priority 2: monthly 96-block shape, scaled for demand keys
+    if (monthly96 && monthly96[key] && monthly96[key][calMo]) {
+      const base = monthly96[key][calMo];
+      if (key.startsWith("demand")) {
+        const f = dailyScaleFactor(dayOfMonth, dow, calMo);
+        bd[key] = { [calMo]: base.map(v => Math.round(v * f)) };
+      } else {
+        // Price blocks: use monthly shape as-is (no daily scaling)
+        bd[key] = { [calMo]: base };
+      }
+      return;
+    }
+  });
+  return bd;
 };
 
 // ══════════════════════════════════════════════════════════════
@@ -283,15 +336,16 @@ const DEF_MKT = {
   bankRate: [2.7, 2.6, 2.9, 3.2, 3.5, 4.2, 3.9, 3.6, 3.4, 3.2, 3.0, 2.8],
   damLim: 500, rtmLim: 200, gdamLim: 300, bilatLim: 800, bankLim: 300,
   recSolarPrice: 2.00, recNonSolarPrice: 1.50, carbonPrice: 0,
+  gnaQuantum: 0, tgnaRate: 0,
 };
 // Calendar-month indexed (Jan=0 ... Dec=11)
 const DEF_STOA = [
-  { id: 1, seg: "Bilateral", name: "NTPC Bilateral", cpty: "NTPC Vidyut Vyapar", dir: "BUY", mw: 200, rate: 3.40, months: [1,1,1,1,1,1,1,1,1,1,1,1], hrs: "RTC", status: "ACTIVE" },
-  { id: 2, seg: "Bilateral", name: "Adani Wind PPA", cpty: "Adani Green", dir: "BUY", mw: 150, rate: 2.85, months: [1,1,1,1,1,1,1,1,1,1,1,1], hrs: "RTC", status: "ACTIVE" },
-  { id: 3, seg: "Bilateral", name: "Peak Bilateral", cpty: "NHPC Ltd", dir: "BUY", mw: 100, rate: 4.10, months: [0,0,0,0,1,1,1,1,0,0,0,0], hrs: "PEAK", status: "ACTIVE" },
-  { id: 4, seg: "Bilateral", name: "Surplus Sale", cpty: "Tata Power Trading", dir: "SELL", mw: 80, rate: 3.60, months: [1,1,0,0,0,0,0,0,0,0,1,1], hrs: "OFF-PEAK", status: "ACTIVE" },
-  { id: 5, seg: "Banking", name: "AP-TS Banking", cpty: "APTRANSCO", dir: "BUY", mw: 120, rate: 0.10, months: [1,1,1,1,1,1,1,1,1,1,1,1], hrs: "RTC", status: "ACTIVE", injectMo: [1,1,0,0,0,0,0,0,0,0,1,1], withdrawMo: [0,0,0,0,1,1,1,1,0,0,0,0], lossPct: 2, bankRatio: 100 },
-  { id: 6, seg: "Banking", name: "KA-TS Banking", cpty: "KPTCL", dir: "BUY", mw: 80, rate: 0.15, months: [1,1,1,1,1,1,1,1,1,1,1,1], hrs: "RTC", status: "ACTIVE", injectMo: [1,1,1,1,0,0,0,0,0,0,0,1], withdrawMo: [0,0,0,0,1,1,1,1,1,1,1,0], lossPct: 3, bankRatio: 100 },
+  { id: 1, seg: "Bilateral", name: "NTPC Bilateral", cpty: "NTPC Vidyut Vyapar", dir: "BUY", mw: 200, rate: 3.40, months: [1,1,1,1,1,1,1,1,1,1,1,1], hrs: "RTC", status: "ACTIVE", corridor: "GNA" },
+  { id: 2, seg: "Bilateral", name: "Adani Wind PPA", cpty: "Adani Green", dir: "BUY", mw: 150, rate: 2.85, months: [1,1,1,1,1,1,1,1,1,1,1,1], hrs: "RTC", status: "ACTIVE", corridor: "GNA" },
+  { id: 3, seg: "Bilateral", name: "Peak Bilateral", cpty: "NHPC Ltd", dir: "BUY", mw: 100, rate: 4.10, months: [0,0,0,0,1,1,1,1,0,0,0,0], hrs: "PEAK", status: "ACTIVE", corridor: "TGNA" },
+  { id: 4, seg: "Bilateral", name: "Surplus Sale", cpty: "Tata Power Trading", dir: "SELL", mw: 80, rate: 3.60, months: [1,1,0,0,0,0,0,0,0,0,1,1], hrs: "OFF-PEAK", status: "ACTIVE", corridor: "GNA" },
+  { id: 5, seg: "Banking", name: "AP-TS Banking", cpty: "APTRANSCO", dir: "BUY", mw: 120, rate: 0.10, months: [1,1,1,1,1,1,1,1,1,1,1,1], hrs: "RTC", status: "ACTIVE", corridor: "GNA", injectMo: [1,1,0,0,0,0,0,0,0,0,1,1], withdrawMo: [0,0,0,0,1,1,1,1,0,0,0,0], lossPct: 2, bankRatio: 100 },
+  { id: 6, seg: "Banking", name: "KA-TS Banking", cpty: "KPTCL", dir: "BUY", mw: 80, rate: 0.15, months: [1,1,1,1,1,1,1,1,1,1,1,1], hrs: "RTC", status: "ACTIVE", corridor: "TGNA", injectMo: [1,1,1,1,0,0,0,0,0,0,0,1], withdrawMo: [0,0,0,0,1,1,1,1,1,1,1,0], lossPct: 3, bankRatio: 100 },
 ];
 const DEF_RPO = {
   solarPct: 10.44, nonSolarPct: 18.17, hydroPct: 1.12, esoPct: 1.0,
@@ -502,8 +556,8 @@ function dispatch96(plants, peakMW, mi, stoa, mkt, fdreList, scenarioMult = {}, 
   })();
 
   // ── Fixed costs (computed ONCE, outside loop) ──
-  const totalFixedCosts = safeSum(activePlants.filter(p => p.fixedCost), p => (p.fixedCost || 0) * p.pMax) / 100000; // ₹ Cr/month
-  const fixedCostPerBlock = safeSum(activePlants.filter(p => p.fixedCost), p => (p.fixedCost || 0) * p.pMax / (daysInMonth * 96)) / 1000; // ₹ lakhs/block
+  const totalFixedCosts = safeSum(activePlants.filter(p => p.fixedCost), p => (p.fixedCost || 0) * p.pMax) / 10000000; // ₹/MW/mo × MW = ₹/mo ÷ 10⁷ = ₹ Cr/month
+  const fixedCostPerBlock = safeSum(activePlants.filter(p => p.fixedCost), p => (p.fixedCost || 0) * p.pMax / (daysInMonth * 96)) / 100000; // ₹/block ÷ 10⁵ = ₹ lakhs/block
 
   // ════════════════════════════════════════════════════════════
   //  PASS 1: Compute net residual demand & marginal cost curve
@@ -885,7 +939,10 @@ function dispatch96(plants, peakMW, mi, stoa, mkt, fdreList, scenarioMult = {}, 
     // Sale revenues: market surplus at block DAM (capped above), bilateral STOA sale at contract rate
     const surplusRevenue = surplus > 0 ? surplus * damPrice96[t] * blockHrs * 10 / 1000 : 0;
     const stoaSellRevenue = stoaSellBilat > 0 ? stoaSellBilat * stoaSellRate * blockHrs * 10 / 1000 : 0;
-    const blockCost = varCost + startCostBlock / 1000 - surplusRevenue - stoaSellRevenue;
+    // Start cost (₹ lakhs): representative-day model can't capture actual startup frequency,
+    // so we amortise over 1 day (96 blocks) to keep blockCost units consistent (₹ lakhs).
+    // The raw totalStartCosts is preserved in _meta for separate reporting.
+    const blockCost = varCost + startCostBlock / 96 - surplusRevenue - stoaSellRevenue;
 
     blks.push({
       t, lbl: TB[t].lbl, dem: d, src, gen, chg: chargingLoad,
@@ -936,7 +993,7 @@ function aggHourly(b96) {
       dem: Math.round(safeMean(s, "dem")), gen: Math.round(safeMean(s, "gen")),
       chg: Math.round(safeMean(s, b => b.chg || 0)),
       def: Math.round(safeMean(s, "def")), sur: Math.round(safeMean(s, "sur")),
-      curtailment: Math.round(safeSum(s, "curtailment")),
+      curtailment: Math.round(safeMean(s, "curtailment")),
       mkt: Math.round(safeMean(s, "mkt")),
       mktDAM: Math.round(safeMean(s, "mktDAM")), mktGDAM: Math.round(safeMean(s, b => b.mktGDAM || 0)), mktRTM: Math.round(safeMean(s, "mktRTM")),
       fdreMW: Math.round(safeMean(s, b => b.fdreMW || 0)),
@@ -983,6 +1040,62 @@ function aggMonthly(b96, days) {
 }
 
 // ══════════════════════════════════════════════════════════════
+//  GNA / T-GNA CORRIDOR ANNOTATION (post-dispatch layer)
+// ══════════════════════════════════════════════════════════════
+function annotateGNA(b96, plants, stoa, mkt, mi) {
+  const gnaQ = mkt.gnaQuantum || 0;
+  const tgnaR = mkt.tgnaRate || 0;
+  if (gnaQ <= 0) return null; // GNA disabled — no annotation
+  return b96.map(b => {
+    // LTA plants on GNA: sum dispatched MW for plants with corridor === "GNA" (default)
+    let ltaGNA = 0, ltaTGNA = 0;
+    Object.values(b.src).forEach(s => {
+      const plant = plants.find(p => p.id === s.id);
+      const cor = plant ? (plant.corridor || "GNA") : "GNA";
+      const mw = Math.max(0, s.mw || 0);
+      if (cor === "GNA") ltaGNA += mw; else ltaTGNA += mw;
+    });
+    // FDRE on GNA (always — LTA equivalent)
+    ltaGNA += (b.fdreMW || 0);
+    // STOA bilateral/banking: check per-contract corridor
+    let stoaGNA = 0, stoaTGNA = 0;
+    const stoaBuyMW = b.stoaBuy || 0;
+    // Approximate: attribute STOA buy proportionally across active contracts by corridor
+    if (stoaBuyMW > 0 && stoa && stoa.length > 0) {
+      const active = stoa.filter(c => c.status === "ACTIVE" && c.dir === "BUY" && c.months && c.months[mi]);
+      const gnaMW = active.filter(c => (c.corridor || "GNA") === "GNA").reduce((s, c) => s + c.mw, 0);
+      const tgnaMW = active.filter(c => c.corridor === "TGNA").reduce((s, c) => s + c.mw, 0);
+      const total = gnaMW + tgnaMW;
+      if (total > 0) {
+        stoaGNA = Math.round(stoaBuyMW * gnaMW / total);
+        stoaTGNA = stoaBuyMW - stoaGNA;
+      } else {
+        stoaGNA = stoaBuyMW;
+      }
+    }
+    // PX (DAM/GDAM/RTM) — always T-GNA (spot market, not pre-booked GNA)
+    const pxMW = (b.mktDAM || 0) + (b.mktGDAM || 0) + (b.mktRTM || 0);
+
+    const totalGNA = ltaGNA + stoaGNA;
+    const totalTGNA = ltaTGNA + stoaTGNA + pxMW;
+    const gnaUsed = totalGNA;
+    const gnaFree = Math.max(0, gnaQ - gnaUsed);
+    // T-GNA sources that COULD have used GNA headroom (for cost optimization insight)
+    const tgnaOnCorridor = totalTGNA; // MW explicitly on T-GNA corridor
+    // T-GNA cost: all T-GNA corridor MW × tgnaRate
+    const tgnaCostLk = tgnaOnCorridor * tgnaR * 0.25 * 10 / 1000; // ₹ lakhs per 15-min block
+
+    return {
+      t: b.t, lbl: b.lbl || (TB[b.t] ? TB[b.t].lbl : b.t),
+      ltaGNA, ltaTGNA, stoaGNA, stoaTGNA, pxMW,
+      totalGNA, totalTGNA, gnaUsed, gnaFree,
+      tgnaCostLk: +tgnaCostLk.toFixed(3),
+      gnaQ,
+    };
+  });
+}
+
+// ══════════════════════════════════════════════════════════════
 //  SHARED COMPONENTS — PROFESSIONAL UI
 // ══════════════════════════════════════════════════════════════
 function KPI({ label, value, unit, color, accent, sub }) {
@@ -1017,17 +1130,169 @@ function Minimap({ total, offset, onSeek }) {
 function StatusDot({ color, label }) {
   return <span style={{ ...lbl, fontSize: 10, color: C.t2, display: "inline-flex", alignItems: "center", gap: 3 }}><span style={{ width: 6, height: 6, borderRadius: "50%", background: color, display: "inline-block", boxShadow: `0 0 4px ${color}55` }} />{label}</span>;
 }
-// Sidebar nav items
+// ══════════════════════════════════════════════════════════════
+//  PAGE INFO — help content for each tab
+// ══════════════════════════════════════════════════════════════
+const PAGE_INFO = {
+  overview: {
+    title: "Overview",
+    sections: [
+      { heading: "Purpose", text: "Executive summary of the 12-month dispatch plan. Shows annual KPIs — demand, own generation, market purchase, curtailment, cost, RPO compliance, and T-GNA exposure — at a glance." },
+      { heading: "Key Metrics", text: "Annual Demand (MU): total energy requirement across the planning horizon. Own Generation (MU): energy dispatched from contracted portfolio (LTA plants + FDRE). Open Market (MU): energy purchased from DAM, GDAM, and RTM segments. Curtailment (MU): surplus energy that couldn't be sold (exceeds market segment limits). Avg Cost (Rs/kWh): weighted average procurement cost including variable, fixed, and market costs. RPO (%): Renewable Purchase Obligation compliance against CERC targets." },
+      { heading: "How to Read", text: "The generation stack chart shows the selected month's 96-block dispatch profile — how demand is met hour-by-hour from different sources. The energy balance shows all 12 months side by side. Use the month selector in the header bar to change the focus month." },
+      { heading: "Methodology", text: "Results are produced by the dispatch96 engine — a 3-pass least-cost optimiser that runs 96 fifteen-minute blocks per month. Pass 1: compute net residual demand (demand minus must-run RE, FDRE, STOA). Pass 2: schedule storage (BESS/PSP) using chronological charge-discharge logic. Pass 3: fill remaining demand via thermal merit order + market segments competing on block-level prices." },
+    ],
+  },
+  config: {
+    title: "Configure",
+    sections: [
+      { heading: "Purpose", text: "Single input surface for all planning parameters. Every edit here feeds the dispatch engine. After making changes, click RUN DISPATCH in the header bar to recompute results." },
+      { heading: "Data Import", text: "Upload a 96-block Excel template with monthly or daily demand (MW), DAM/GDAM/RTM price curves (Rs/MWh). The template uses one row per 15-min block and one sheet per variable. Uploaded data overrides the built-in reference dataset." },
+      { heading: "Supply Portfolio", text: "Generation portfolio table listing all contracted plants with PMax, PMin, technical minimum %, ECR (variable cost Rs/kWh), fixed cost, availability, must-run flag, ramp rates, min up/down times, and GNA/T-GNA corridor assignment. Storage assets (BESS/PSP/pondage hydro) are configured separately with MWh capacity, efficiency, SoC limits, and cycle budgets." },
+      { heading: "Demand & Market", text: "Monthly peak demand (MW) and energy targets (MU) drive the demand shape. Market prices set the DAM/GDAM/RTM MCPs and segment MW limits. When 96-block data is uploaded, block-level prices override these monthly averages." },
+      { heading: "Contracts", text: "STOA: bilateral buy/sell contracts and banking arrangements with counterparty, MW, rate, delivery hours (RTC/Peak/Off-Peak/Custom), active months, and corridor (GNA/T-GNA). FDRE: firm dispatchable RE contracts with capacity, tariff, delivery profile, and guaranteed CUF." },
+      { heading: "Policy & Scenarios", text: "RPO targets (Solar/Non-Solar/Hydro/ESO %) set the compliance benchmark. Scenarios define demand/RE/price/fuel multipliers for sensitivity analysis — each runs as a separate dispatch when you view the Scenarios or Balance tabs." },
+    ],
+  },
+  grid: {
+    title: "96-Block Grid",
+    sections: [
+      { heading: "Purpose", text: "Granular block-by-block view of the dispatch for the selected month. Each row is one 15-minute time block (00:00 to 23:45), showing demand, each plant's dispatched MW, market purchases, storage state, costs, and prices." },
+      { heading: "How to Read", text: "Columns are colour-coded by source type. Thermal plants show commitment state (COMMITTED, STARTING, STANDBY, MIN-LOAD, RAMP-DN). Storage shows CHARGING/DISCHARGE/IDLE. The demand column is the target; the sum of all source columns should match demand plus any surplus or unserved energy." },
+      { heading: "Methodology", text: "The grid displays raw output from dispatch96. Each block is independently optimised subject to inter-block constraints (ramp rates, min up/down times, storage SoC continuity). Market segments (DAM/GDAM/RTM) compete with thermals on block-level price — a cheap DAM block displaces costlier own thermal down to its commitment floor." },
+    ],
+  },
+  dispatch: {
+    title: "Dispatch",
+    sections: [
+      { heading: "Purpose", text: "Visual analysis of the dispatch — generation stack area charts, surplus-deficit profile, storage cycles, merit order, and price curves for the selected month." },
+      { heading: "Generation Stack", text: "Stacked area chart showing how demand is met across the day. Bottom layers are must-run (RE, nuclear, hydro), then FDRE, STOA, thermals in merit order, and market segments on top. The white demand line sits over the stack — any gap above the stack is unserved energy." },
+      { heading: "Surplus-Deficit", text: "Bars above zero indicate surplus (own generation exceeds demand), bars below indicate deficit (market purchase needed). This is the STRUCTURAL gap before market procurement — not the same as unserved energy." },
+      { heading: "Storage Cycles", text: "Shows BESS/PSP charge-discharge pattern. Negative bars = charging (absorbing surplus or buying cheap market energy). Positive bars = discharging (meeting deficit or selling into expensive blocks). The SoC chart shows state-of-charge trajectory through the day." },
+      { heading: "Merit Order", text: "Table ranking all sources by effective cost (ECR). Shows dispatched MW, energy (MU), capacity factor, and cost contribution. Market segments appear in the merit order at their block-level prices." },
+      { heading: "Exports", text: "CSV exports the current month's 96-block dispatch. XLSX exports the full 12-month results including monthly summary, hourly matrices, supply-by-source, and the selected month's block detail." },
+    ],
+  },
+  market: {
+    title: "Market",
+    sections: [
+      { heading: "Purpose", text: "Analysis of open-market exposure — DAM, GDAM, RTM purchase volumes, prices, surplus sales, and GNA corridor utilisation." },
+      { heading: "PX Quantum Chart", text: "Block-level stacked area showing MW purchased from each market segment. DAM (blue) fills first (cheapest), then GDAM (green), then RTM (pink, highest premium). The height indicates total market dependence at each time block." },
+      { heading: "GNA Corridor Utilisation", text: "Appears when GNA Quantum > 0 in Configure. Stacked area shows how the state's General Network Access corridor is consumed: LTA plants on GNA, STOA on GNA (bottom), then T-GNA sources (LTA on T-GNA, STOA on T-GNA, PX on T-GNA). The dashed green reference line marks the GNA quantum — everything above it incurs T-GNA charges at the configured rate." },
+      { heading: "Price Curves", text: "DAM, GDAM, RTM, and marginal cost curves across the 96 blocks. The marginal cost line shows which thermal sets the system price at each block — when market price is below this, economy purchase displaces own generation." },
+      { heading: "Annual Summary", text: "Month-by-month table of DAM/GDAM/RTM volumes (MU), surplus sold, and net PX position. Click any month row to navigate to its block detail." },
+    ],
+  },
+  rpo: {
+    title: "RPO Compliance",
+    sections: [
+      { heading: "Purpose", text: "Tracks Renewable Purchase Obligation compliance against CERC/SERC mandated targets for Solar, Non-Solar (Wind), Hydro, and Energy Storage obligations." },
+      { heading: "How It Works", text: "Total annual consumption (MU) is computed from the dispatch. RE generation from the portfolio (Solar, Wind, Hydro, Hybrid, BESS/PSP) is tallied. STOA contracts with RE-tagged counterparties contribute proportionally. FDRE contracts contribute based on their RE technology mix. Each category is compared against the percentage target to determine shortfall." },
+      { heading: "REC Cost", text: "Any shortfall can be covered by purchasing Renewable Energy Certificates. The estimated REC cost uses the configured REC prices (Rs/kWh) — Solar RECs, Non-Solar RECs, and Hydro RECs. Cost = shortfall MU x REC price x 10 lakhs/MU = Cr." },
+      { heading: "Monthly Chart", text: "Stacked bar shows monthly RE generation by type, with the dashed RPO target line. Months where the stack exceeds the target contribute surplus that offsets deficit months in the annual tally." },
+    ],
+  },
+  scenarios: {
+    title: "Scenarios",
+    sections: [
+      { heading: "Purpose", text: "Compares results across stochastic scenarios — each scenario applies different multipliers to demand, RE generation, market prices, and fuel costs, then runs a full 12-month dispatch independently." },
+      { heading: "Scenario Parameters", text: "Each scenario has: Demand Set (Base/High/Low forecast), Demand Multiplier, RE Multiplier (scales solar/wind output), Price Multiplier (scales DAM/GDAM/RTM), Fuel Multiplier (scales thermal ECR). These are configured in the Configure tab under Policy & Scenarios." },
+      { heading: "Comparison Table", text: "Shows each active scenario's annual results side by side — demand MU, cost Cr, avg cost Rs/kWh, market purchase MU, curtailment MU, surplus MU, unserved MU, and peak MW. Use this to identify cost sensitivity to demand growth, RE variability, or price shocks." },
+      { heading: "How to Use", text: "Activate/deactivate scenarios in Configure. Run Dispatch to recompute. The Scenarios tab is output-only — it displays comparison results. To change scenario parameters, go to Configure > Policy & Scenarios." },
+    ],
+  },
+  balance: {
+    title: "Balance",
+    sections: [
+      { heading: "Purpose", text: "Comprehensive energy balance and cost analysis with scenario filtering. The Balance tab can run any active scenario and show the full year's supply-demand position under that scenario." },
+      { heading: "Scenario Filter", text: "Select a scenario from the top bar to recompute the entire year under that scenario's multipliers. The Base Case uses the primary dispatch results. Other scenarios re-run dispatch96 with modified demand/RE/price/fuel." },
+      { heading: "Monthly Net Position", text: "Bar chart showing surplus (+) and deficit (-) energy by month. Surplus months have excess generation that can be sold; deficit months depend on market purchases." },
+      { heading: "Surplus-Deficit Heatmap", text: "Month x Hour matrix showing where the portfolio has surplus (green) vs deficit (red) throughout the year. Identifies systematic patterns — e.g., solar surplus at midday, thermal deficit in evening peaks." },
+      { heading: "Hourly Gap Table", text: "Detailed numeric table: demand, supply, gap, and market purchase for each hour of each month. The gap = own generation capacity minus demand — negative values require market procurement." },
+      { heading: "Capacity Adequacy", text: "Compares total installed capacity (adjusted for availability) against peak demand month by month. Identifies months where even full portfolio dispatch cannot meet peak." },
+      { heading: "Exports", text: "XLSX exports the selected scenario's full results — monthly summary, hourly demand/gap matrices, supply by source, and 96-block dispatch for the current month. PDF uses browser print." },
+    ],
+  },
+  banking: {
+    title: "Banking Simulation",
+    sections: [
+      { heading: "Purpose", text: "Evaluates inter-state banking proposals — energy exchange arrangements where you inject energy during surplus months and withdraw during deficit months, with transmission losses and banking charges." },
+      { heading: "How It Works", text: "The simulator takes a banking proposal (inject months, withdraw months, MW quantum, loss %, banking ratio) and runs it against the dispatch results. It computes: energy injected (MU), energy withdrawn (MU, net of losses), net benefit (cost saving from avoided market purchase minus injection cost), and the effective cost of banked energy." },
+      { heading: "Isolation", text: "Banking Sim is a sandbox — it does NOT affect the main dispatch, Balance, or other tabs. It runs its own scenario dispatch internally so you can test proposals without changing planning results." },
+      { heading: "Scenario Selection", text: "You can run the banking evaluation under any active scenario (Base, High Demand, etc.) to test whether the proposal remains beneficial under stress conditions." },
+    ],
+  },
+  uc: {
+    title: "UC Simulation",
+    sections: [
+      { heading: "Purpose", text: "Unit Commitment simulation — tests alternative commitment strategies by adjusting which plants are committed, their loading levels, and market participation, then re-runs dispatch to see the cost and reliability impact." },
+      { heading: "How It Works", text: "The UC Sim takes the current portfolio and demand but lets you override plant commitment decisions (force-on, force-off, change loading order). It re-runs dispatch96 with these overrides and compares results against the base case." },
+      { heading: "Isolation", text: "Like Banking Sim, UC Sim is a sandbox. Changes here do NOT affect any other tab. Results are for analysis only — use them to inform your commitment strategy, then update the main Configure tab if you want to adopt the changes." },
+      { heading: "Use Cases", text: "Test the impact of taking a large thermal offline for maintenance. Evaluate whether committing an expensive gas peaker saves money by reducing market exposure during peak hours. Assess the cost of must-running a plant for grid stability vs economic dispatch." },
+    ],
+  },
+};
+
+// InfoButton — small "i" icon that opens the help modal for the current tab
+function InfoButton({ tabId, onOpen }) {
+  return (
+    <button onClick={() => onOpen(tabId)} title="Page info & methodology"
+      style={{ width: 22, height: 22, borderRadius: "50%", border: `1.5px solid ${C.focus}66`, background: C.focus + "15", color: C.focus, cursor: "pointer", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 700, fontStyle: "italic", fontFamily: "Georgia, serif", lineHeight: 1, flexShrink: 0, transition: "all 0.15s" }}>
+      i
+    </button>
+  );
+}
+
+// InfoModal — overlay showing page help content
+function InfoModal({ tabId, onClose }) {
+  const info = PAGE_INFO[tabId];
+  if (!info) return null;
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div onClick={e => e.stopPropagation()} style={{ background: C.elev, border: `1px solid ${C.brd}`, borderRadius: 6, maxWidth: 620, width: "100%", maxHeight: "80vh", overflow: "auto", boxShadow: `0 8px 32px rgba(0,0,0,0.5)` }}>
+        {/* Header */}
+        <div style={{ display: "flex", alignItems: "center", padding: "14px 18px 12px", borderBottom: `1px solid ${C.brd}`, position: "sticky", top: 0, background: C.elev, zIndex: 1 }}>
+          <div style={{ width: 28, height: 28, borderRadius: "50%", border: `2px solid ${C.focus}`, background: C.focus + "18", display: "flex", alignItems: "center", justifyContent: "center", marginRight: 10, flexShrink: 0 }}>
+            <span style={{ fontSize: 16, fontWeight: 700, fontStyle: "italic", fontFamily: "Georgia, serif", color: C.focus }}>i</span>
+          </div>
+          <span style={{ ...lbl, fontSize: 14, fontWeight: 800, color: C.t1, letterSpacing: 1, flex: 1 }}>{info.title}</span>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: C.t2, cursor: "pointer", fontSize: 18, padding: "4px 8px", borderRadius: 3, lineHeight: 1 }}>✕</button>
+        </div>
+        {/* Body */}
+        <div style={{ padding: "16px 18px 20px" }}>
+          {info.sections.map((s, i) => (
+            <div key={i} style={{ marginBottom: i < info.sections.length - 1 ? 16 : 0 }}>
+              <div style={{ ...lbl, fontSize: 10, fontWeight: 700, color: C.focus, letterSpacing: "0.1em", marginBottom: 5, display: "flex", alignItems: "center", gap: 6 }}>
+                <div style={{ width: 4, height: 4, borderRadius: "50%", background: C.focus, flexShrink: 0 }} />
+                {s.heading}
+              </div>
+              <div style={{ ...ui, fontSize: 12.5, color: C.t2, lineHeight: 1.65, paddingLeft: 10 }}>{s.text}</div>
+            </div>
+          ))}
+        </div>
+        {/* Footer */}
+        <div style={{ borderTop: `1px solid ${C.brd}`, padding: "10px 18px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <span style={{ ...mono, fontSize: 10, color: C.t3 }}>P-OPT OUTLOOK HELP</span>
+          <button onClick={onClose} style={{ ...lbl, fontSize: 10, padding: "4px 14px", borderRadius: 3, border: `1px solid ${C.focus}44`, cursor: "pointer", background: C.focus + "15", color: C.focus, fontWeight: 600 }}>CLOSE</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Sidebar nav items — zone: "input" | "output" | "sim"
+const NAV_ZONE_CLR = { input: "#FF9800", output: "#4CAF50", sim: "#AB47BC" };
 const NAV = [
-  { id: "overview", label: "Overview", icon: "M3 3h7v7H3zm11 0h7v7h-7zM3 14h7v7H3zm11 0h7v7h-7z" },
-  { id: "config", label: "Configure", icon: "M12 15.5A3.5 3.5 0 018.5 12 3.5 3.5 0 0112 8.5a3.5 3.5 0 013.5 3.5 3.5 0 01-3.5 3.5m7.43-2.53c.04-.32.07-.64.07-.97s-.03-.66-.07-1l2.11-1.63c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65A.49.49 0 0014 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64L4.57 11c-.04.34-.07.67-.07 1s.03.65.07.97l-2.11 1.66c-.19.15-.25.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1.01c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.24.42.49.42h4c.25 0 .46-.18.49-.42l.38-2.65c.61-.25 1.17-.58 1.69-.98l2.49 1.01c.22.08.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64z" },
-  { id: "grid", label: "96-Block", icon: "M3 3h4v4H3zm7 0h4v4h-4zm7 0h4v4h-4zM3 10h4v4H3zm7 0h4v4h-4zm7 0h4v4h-4zM3 17h4v4H3zm7 0h4v4h-4zm7 0h4v4h-4z" },
-  { id: "dispatch", label: "Dispatch", icon: "M4 20h16V4H4v16zm2-7h3v5H6v-5zm5 0h3v5h-3v-5zm5-4h3v9h-3V9z" },
-  { id: "market", label: "Market", icon: "M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zm0-10v2h14V7H7z" },
-  { id: "banking", label: "Banking", icon: "M6.99 11L3 15l3.99 4v-3H14v-2H6.99v-3zM21 9l-3.99-4v3H10v2h7.01v3L21 9z" },
-  { id: "rpo", label: "RPO", icon: "M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4z" },
-  { id: "scenarios", label: "Scenarios", icon: "M14 6l-3.75 5 2.85 3.8-1.6 1.2C9.81 13.75 7 10 7 10l-6 8h22l-9-12z" },
-  { id: "balance", label: "Balance", icon: "M12 3v10.55A4 4 0 1014 17V7h4V3h-6z" },
+  { id: "overview", label: "Overview", zone: "output", icon: "M3 3h7v7H3zm11 0h7v7h-7zM3 14h7v7H3zm11 0h7v7h-7z" },
+  { id: "config", label: "Configure", zone: "input", icon: "M12 15.5A3.5 3.5 0 018.5 12 3.5 3.5 0 0112 8.5a3.5 3.5 0 013.5 3.5 3.5 0 01-3.5 3.5m7.43-2.53c.04-.32.07-.64.07-.97s-.03-.66-.07-1l2.11-1.63c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65A.49.49 0 0014 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64L4.57 11c-.04.34-.07.67-.07 1s.03.65.07.97l-2.11 1.66c-.19.15-.25.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1.01c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.24.42.49.42h4c.25 0 .46-.18.49-.42l.38-2.65c.61-.25 1.17-.58 1.69-.98l2.49 1.01c.22.08.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64z" },
+  { id: "grid", label: "96-Block", zone: "output", icon: "M3 3h4v4H3zm7 0h4v4h-4zm7 0h4v4h-4zM3 10h4v4H3zm7 0h4v4h-4zm7 0h4v4h-4zM3 17h4v4H3zm7 0h4v4h-4zm7 0h4v4h-4z" },
+  { id: "dispatch", label: "Dispatch", zone: "output", icon: "M4 20h16V4H4v16zm2-7h3v5H6v-5zm5 0h3v5h-3v-5zm5-4h3v9h-3V9z" },
+  { id: "market", label: "Market", zone: "output", icon: "M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zm0-10v2h14V7H7z" },
+  { id: "rpo", label: "RPO", zone: "output", icon: "M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4z" },
+  { id: "scenarios", label: "Scenarios", zone: "output", icon: "M14 6l-3.75 5 2.85 3.8-1.6 1.2C9.81 13.75 7 10 7 10l-6 8h22l-9-12z" },
+  { id: "balance", label: "Balance", zone: "output", icon: "M12 3v10.55A4 4 0 1014 17V7h4V3h-6z" },
+  { id: "banking", label: "Banking Sim", zone: "sim", icon: "M6.99 11L3 15l3.99 4v-3H14v-2H6.99v-3zM21 9l-3.99-4v3H10v2h7.01v3L21 9z" },
+  { id: "uc", label: "UC Sim", zone: "sim", icon: "M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" },
 ];
 
 // ══════════════════════════════════════════════════════════════
@@ -1100,7 +1365,7 @@ function PlantEditor({ plants, setPlants }) {
   const update = (id, key, val) => setPlants(prev => prev.map(p => p.id === id ? { ...p, [key]: val } : p));
   const addPlant = () => {
     const id = Math.max(0, ...plants.map(p => p.id)) + 1;
-    setPlants(prev => [...prev, { id, name: `New Unit ${id}`, type: "Thermal", fuel: "coal_fsa", pMax: 100, pMin: 40, ecr: 4.0, fixedCost: 1200, startCost: 10, avail: 90, mustRun: false, rampUp: 5, rampDn: 4, minUp: 4, minDn: 2 }]);
+    setPlants(prev => [...prev, { id, name: `New Unit ${id}`, type: "Thermal", fuel: "coal_fsa", pMax: 100, pMin: 40, ecr: 4.0, fixedCost: 1200, startCost: 10, avail: 90, mustRun: false, rampUp: 5, rampDn: 4, minUp: 4, minDn: 2, corridor: "GNA" }]);
   };
   const delPlant = (id) => setPlants(prev => prev.filter(p => p.id !== id));
   const types = ["Thermal", "Solar", "Wind", "Hydro", "BESS", "PSP", "Hybrid", "Nuclear", "Gas"];
@@ -1118,7 +1383,7 @@ function PlantEditor({ plants, setPlants }) {
       <div style={{ overflow: "auto", border: `1px solid ${C.brd}`, borderRadius: 2, maxHeight: 400 }}>
         <table style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead><tr>
-            {["", "Name", "Type", "Fuel", "From", "PMax", "PMin", "TM %", "ECR ₹/kWh", "Fixed ₹/MW/mo", "Start ₹L", "Avail%", "Must", "Ramp Up", "Ramp Dn", "MinUp", "MinDn", "Pondage"].map((h, i) => (
+            {["", "Name", "Type", "Fuel", "From", "PMax", "PMin", "TM %", "ECR ₹/kWh", "Fixed ₹/MW/mo", "Start ₹L", "Avail%", "Must", "Ramp Up", "Ramp Dn", "MinUp", "MinDn", "Pondage", "Corridor"].map((h, i) => (
               <th key={i} style={{ ...lbl, fontSize: 10, fontWeight: 700, color: C.t2, padding: "7px 5px", background: C.base, borderBottom: `1px solid ${C.brd}`, textAlign: i > 4 ? "right" : "left", position: "sticky", top: 0, zIndex: 1, whiteSpace: "nowrap" }}>{h}</th>
             ))}
           </tr></thead>
@@ -1169,6 +1434,12 @@ function PlantEditor({ plants, setPlants }) {
                     <option value="without">Without</option>
                   </select>
                 ) : <span style={{ ...mono, fontSize: 9, color: C.t3 }}>—</span>}
+              </td>
+              <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}15` }}>
+                <select value={p.corridor || "GNA"} onChange={e => update(p.id, "corridor", e.target.value)} style={{ ...ui, fontSize: 9, background: C.overlay, color: (p.corridor || "GNA") === "GNA" ? C.pos : C.warn, border: `1px solid ${C.brd}`, borderRadius: 3, padding: "2px 2px", cursor: "pointer", minWidth: 42, fontWeight: 600 }}>
+                  <option value="GNA">GNA</option>
+                  <option value="TGNA">T-GNA</option>
+                </select>
               </td>
             </tr>
           ))}</tbody>
@@ -1387,6 +1658,8 @@ function MarketEditor({ mkt, setMkt, moNames, months, uploaded96 }) {
           { key: "recSolarPrice", label: "REC Solar ₹/kWh", min: 0 },
           { key: "recNonSolarPrice", label: "REC Non-Sol ₹/kWh", min: 0 },
           { key: "carbonPrice", label: "Carbon ₹/tCO2", min: 0 },
+          { key: "gnaQuantum", label: "GNA Quantum MW", min: 0 },
+          { key: "tgnaRate", label: "T-GNA ₹/kWh", min: 0 },
         ].map(p => {
           const rtmOff = p.key === "rtmPrem" && hasRtmBlocks;
           return (
@@ -1420,7 +1693,7 @@ const TIME_LABELS = Array.from({ length: 96 }, (_, i) => {
 const FY_MO = ["Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May", "Jun"];
 const FY_CAL = [6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4, 5]; // FY index → calendar month
 
-function DataUploader({ demand, setDemand, mkt, setMkt, months, moNames, uploaded96, setUploaded96, demandMU, setDemandMU }) {
+function DataUploader({ demand, setDemand, mkt, setMkt, months, moNames, uploaded96, setUploaded96, demandMU, setDemandMU, uploaded96Daily, setUploaded96Daily }) {
   const [status, setStatus] = useState(null);
   const fileRef = useRef(null);
 
@@ -1439,6 +1712,24 @@ function DataUploader({ demand, setDemand, mkt, setMkt, months, moNames, uploade
       // Set column widths
       ws["!cols"] = [{ wch: 12 }, ...FY_MO.map(() => ({ wch: 10 }))];
       XLSX.utils.book_append_sheet(wb, ws, spec.sheet);
+    });
+    // Add daily template sheets (rows = dates for current+next month, cols = B1..B96)
+    const now = new Date();
+    const curMo = now.getMonth(), curYr = now.getFullYear();
+    const nxtMo = (curMo + 1) % 12, nxtYr = curMo === 11 ? curYr + 1 : curYr;
+    DAILY_SHEETS.forEach(spec => {
+      const dHeader = ["Date", ...Array.from({ length: 96 }, (_, i) => `B${i + 1}`)];
+      const dRows = [dHeader];
+      [{ m: curMo, y: curYr }, { m: nxtMo, y: nxtYr }].forEach(({ m, y }) => {
+        const dim = new Date(y, m + 1, 0).getDate();
+        for (let d = 1; d <= dim; d++) {
+          const ds = `${y}-${String(m + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+          dRows.push([ds, ...Array(96).fill("")]);
+        }
+      });
+      const dws = XLSX.utils.aoa_to_sheet(dRows);
+      dws["!cols"] = [{ wch: 12 }, ...Array(96).fill({ wch: 8 })];
+      XLSX.utils.book_append_sheet(wb, dws, spec.sheet);
     });
     XLSX.writeFile(wb, "POPT_Outlook_96block_template.xlsx");
   };
@@ -1491,8 +1782,63 @@ function DataUploader({ demand, setDemand, mkt, setMkt, months, moNames, uploade
           result[spec.key] = byMonth;
         });
 
+        // ── Daily sheets: rows = dates (YYYY-MM-DD or DD-Mon), cols = B1..B96 ──
+        const dailyResult = {};
+        let dailySheetsFound = 0;
+        DAILY_SHEETS.forEach(spec => {
+          const ws = wb.Sheets[spec.sheet] || (spec.alt ? wb.Sheets[spec.alt] : null);
+          if (!ws) return;
+          dailySheetsFound++;
+          const aoa = XLSX.utils.sheet_to_json(ws, { header: 1 });
+          if (aoa.length < 2) return;
+          // Header row: Date, B1, B2, ... B96 (or 00:00, 00:15, ...)
+          const byDate = {};
+          for (let r = 1; r < aoa.length; r++) {
+            const row = aoa[r];
+            if (!row || !row[0]) continue;
+            // Parse date: try ISO, DD-Mon-YYYY, DD/MM/YYYY, Excel serial
+            let dateStr = null;
+            const raw = row[0];
+            if (typeof raw === "number") {
+              // Excel date serial
+              const d = XLSX.SSF.parse_date_code(raw);
+              if (d) dateStr = `${d.y}-${String(d.m).padStart(2,"0")}-${String(d.d).padStart(2,"0")}`;
+            } else {
+              const s = String(raw).trim();
+              const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+              if (iso) dateStr = `${iso[1]}-${iso[2]}-${iso[3]}`;
+              else {
+                const dmy = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+                if (dmy) dateStr = `${dmy[3]}-${String(dmy[2]).padStart(2,"0")}-${String(dmy[1]).padStart(2,"0")}`;
+                else {
+                  const dmon = s.match(/^(\d{1,2})[- ](\w{3})[- ]?(\d{2,4})?/i);
+                  if (dmon) {
+                    const mi2 = CAL_MO.findIndex(m => m.toLowerCase() === dmon[2].toLowerCase().slice(0,3));
+                    if (mi2 >= 0) {
+                      const yr = dmon[3] ? (dmon[3].length === 2 ? 2000 + parseInt(dmon[3]) : parseInt(dmon[3])) : new Date().getFullYear();
+                      dateStr = `${yr}-${String(mi2 + 1).padStart(2,"0")}-${String(dmon[1]).padStart(2,"0")}`;
+                    }
+                  }
+                }
+              }
+            }
+            if (!dateStr) continue;
+            const blocks = new Array(96).fill(0);
+            for (let b = 0; b < 96 && b + 1 < row.length; b++) {
+              const v = parseFloat(row[b + 1]);
+              if (!isNaN(v)) blocks[b] = v / spec.divisor;
+            }
+            byDate[dateStr] = blocks;
+          }
+          if (Object.keys(byDate).length > 0) dailyResult[spec.key] = byDate;
+        });
+        if (dailySheetsFound > 0 && Object.keys(dailyResult).length > 0) {
+          setUploaded96Daily(dailyResult);
+        }
+        sheetsFound += dailySheetsFound;
+
         if (sheetsFound === 0) {
-          setStatus({ type: "err", msg: "No matching sheets found. Expected: " + UPLOAD_SHEETS.map(s => s.sheet).join(", ") });
+          setStatus({ type: "err", msg: "No matching sheets found. Expected: " + UPLOAD_SHEETS.map(s => s.sheet).join(", ") + " or daily sheets" });
           return;
         }
 
@@ -1531,7 +1877,9 @@ function DataUploader({ demand, setDemand, mkt, setMkt, months, moNames, uploade
         }
 
         const loaded = Object.keys(result);
-        setStatus({ type: "ok", msg: `Loaded ${sheetsFound} sheet${sheetsFound > 1 ? "s" : ""}: ${loaded.join(", ")} — 96 blocks × 12 months` });
+        const dailyDates = dailySheetsFound > 0 ? Object.values(dailyResult).reduce((n, o) => Math.max(n, Object.keys(o).length), 0) : 0;
+        const dailyMsg = dailyDates > 0 ? ` + ${dailyDates} daily profiles` : "";
+        setStatus({ type: "ok", msg: `Loaded ${sheetsFound} sheet${sheetsFound > 1 ? "s" : ""}: ${loaded.join(", ")} — 96 blocks × 12 months${dailyMsg}` });
       } catch (err) {
         setStatus({ type: "err", msg: "Parse error: " + err.message });
       }
@@ -1542,6 +1890,7 @@ function DataUploader({ demand, setDemand, mkt, setMkt, months, moNames, uploade
 
   const clearUploaded = () => {
     setUploaded96(REF96); // restore the built-in reference dataset
+    setUploaded96Daily({});
     setDemand(DEF_DEMAND);
     setDemandMU(DEF_DEMAND_MU);
     setMkt(DEF_MKT);
@@ -1554,7 +1903,7 @@ function DataUploader({ demand, setDemand, mkt, setMkt, months, moNames, uploade
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
       <div style={{ ...ui, fontSize: 11, color: C.t2, lineHeight: 1.5 }}>
-        A built-in reference dataset (96-block demand + DAM/RTM/GDAM prices, FY Jul–Jun) is preloaded. Upload your own XLSX to replace it — download the template, fill in values, and upload.
+        A built-in reference dataset (96-block demand + DAM/RTM/GDAM prices, FY Jul–Jun) is preloaded. Upload your own XLSX to replace it — download the template, fill in values, and upload. The template includes both monthly sheets (96 blocks × 12 months) and daily sheets (96 blocks × each day of current + next month) for day-wise planning in 1D resolution.
       </div>
       <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
         <button onClick={downloadTemplate} style={{ ...btnStyle, background: C.focus + "18", color: C.focus, borderColor: C.focus + "44" }}>
@@ -2026,6 +2375,224 @@ function DailyView({ dailyData, moName }) {
   );
 }
 
+// ══════════════════════════════════════════════════════════════
+//  DAILY PLAN VIEW — day-wise + block-wise dispatch for current + next month
+//  Shows: (1) daily energy bars MU by source, (2) avg MW curves,
+//  (3) day picker to drill into 96-block dispatch, (4) FN/MO aggregation
+// ══════════════════════════════════════════════════════════════
+function DailyPlanView({ dailyChron, moName, selDay, setSelDay, plants, res }) {
+  const { rows, segs, fnRows, moSummary } = useMemo(() => {
+    const segSet = new Set();
+    const built = dailyChron.map((dd, idx) => {
+      const row = {
+        idx, lbl: dd.lbl, day: dd.day, dow: dd.dow, dateStr: dd.dateStr,
+        DemandMU: +dd.agg.demMU, DemandAvgMW: Math.round(dd.agg.demMU * 1000 / 24),
+        PeakMW: dd.pk,
+      };
+      const byType = {};
+      Object.values(dd.agg.srcE).forEach(s => { if (s.mu > 0) byType[s.tp] = (byType[s.tp] || 0) + s.mu; });
+      SEG_ORDER.forEach(seg => {
+        let val = 0;
+        if (seg === "FDRE") val = +(dd.agg.fdreMU || 0);
+        else if (seg === "STOA") val = +(dd.agg.stoaBuyMU || 0);
+        else if (seg === "DAM") val = +(dd.agg.mktDAM_MU || 0);
+        else if (seg === "GDAM") val = +(dd.agg.mktGDAM_MU || 0);
+        else if (seg === "RTM") val = +(dd.agg.mktRTM_MU || 0);
+        else val = byType[seg] || 0;
+        if (val > 0) { row[seg] = +val.toFixed(3); segSet.add(seg); }
+      });
+      row.SupplyMU = +SEG_ORDER.reduce((s, seg) => s + (row[seg] || 0), 0).toFixed(3);
+      row.SupplyAvgMW = Math.round(row.SupplyMU * 1000 / 24);
+      row.DefMU = +dd.agg.defMU;
+      row.SurMU = +(dd.agg.surMU || 0);
+      row.UnsMU = +Math.max(0, dd.agg.defMU - (dd.agg.mktDAM_MU || 0) - (dd.agg.mktGDAM_MU || 0) - (dd.agg.mktRTM_MU || 0)).toFixed(2);
+      row.CostCr = +dd.agg.costCr;
+      row.AvgCost = dd.agg.avgCost;
+      row.CurtailMU = +(dd.agg.curtailMU || 0);
+      return row;
+    });
+
+    // Fortnightly aggregation: FN1 = days 1-15, FN2 = days 16-end
+    const fn1 = built.filter(r => r.day <= 15);
+    const fn2 = built.filter(r => r.day > 15);
+    const aggFN = (days, label) => {
+      if (!days.length) return null;
+      const r = { lbl: label, days: days.length };
+      r.DemandMU = +days.reduce((s, d) => s + d.DemandMU, 0).toFixed(2);
+      r.DemandAvgMW = Math.round(r.DemandMU * 1000 / (days.length * 24));
+      r.PeakMW = Math.max(...days.map(d => d.PeakMW));
+      SEG_ORDER.forEach(seg => {
+        const v = days.reduce((s, d) => s + (d[seg] || 0), 0);
+        if (v > 0) r[seg] = +v.toFixed(3);
+      });
+      r.SupplyMU = +days.reduce((s, d) => s + d.SupplyMU, 0).toFixed(2);
+      r.SupplyAvgMW = Math.round(r.SupplyMU * 1000 / (days.length * 24));
+      r.DefMU = +days.reduce((s, d) => s + d.DefMU, 0).toFixed(2);
+      r.SurMU = +days.reduce((s, d) => s + d.SurMU, 0).toFixed(2);
+      r.UnsMU = +days.reduce((s, d) => s + d.UnsMU, 0).toFixed(2);
+      r.CostCr = +days.reduce((s, d) => s + d.CostCr, 0).toFixed(2);
+      r.CurtailMU = +days.reduce((s, d) => s + d.CurtailMU, 0).toFixed(2);
+      r.AvgCost = r.DemandMU > 0 ? +(r.CostCr * 100 / (r.DemandMU * 10)).toFixed(2) : "0.00";
+      return r;
+    };
+
+    const fnAgg = [aggFN(fn1, "FN1 (1–15)"), aggFN(fn2, `FN2 (16–${Math.max(...built.map(r => r.day))})`)].filter(Boolean);
+
+    // Monthly summary
+    const moSum = aggFN(built, moName);
+
+    return { rows: built, segs: SEG_ORDER.filter(s => segSet.has(s)), fnRows: fnAgg, moSummary: moSum };
+  }, [dailyChron, moName]);
+
+  if (!rows.length) return <div style={{ ...ui, fontSize: 12, color: C.t3, padding: 20, textAlign: "center" }}>No remaining days in {moName}. Select current or next month.</div>;
+
+  const thS = { ...lbl, fontSize: 9, fontWeight: 700, color: C.t2, padding: "5px 5px", background: C.base, borderBottom: `1px solid ${C.brd}`, textAlign: "right", whiteSpace: "nowrap" };
+  const tdS = { ...mono, fontSize: 10, padding: "4px 5px", borderBottom: `1px solid ${C.brd}15`, textAlign: "right" };
+
+  // ── Sub-view selector ──
+  const isFN = res === "fortnightly";
+  const isMO = res === "monthly";
+  const showDailyCharts = !isFN && !isMO;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      {/* ── Daily energy stacked bar chart (MU by source) ── */}
+      {showDailyCharts && (
+        <div>
+          <div style={{ ...lbl, fontSize: 10, color: C.t2, marginBottom: 4 }}>DAILY ENERGY (MU) — GENERATION BY SOURCE</div>
+          <ResponsiveContainer width="100%" height={280}>
+            <ComposedChart data={rows} margin={{ top: 18, right: 10, bottom: 5, left: 10 }}>
+              <CartesianGrid stroke={C.brd + "66"} strokeDasharray="3 3" />
+              <XAxis dataKey="lbl" tick={{ fill: C.t2, fontSize: 9 }} angle={-45} textAnchor="end" height={50} />
+              <YAxis tick={{ fill: C.t2, fontSize: 10 }} label={{ value: "MU", angle: -90, position: "insideLeft", fill: C.t2, fontSize: 10 }} />
+              <Tooltip contentStyle={ttStyle} formatter={(v, name) => [typeof v === "number" ? v.toFixed(3) : v, name]} />
+              <Legend wrapperStyle={{ fontSize: 10 }} iconType="square" />
+              {segs.map((seg, si) => <Bar key={seg} dataKey={seg} stackId="s" fill={SEG_CLR[seg] || C.t3} fillOpacity={0.9} radius={si === segs.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} onClick={(_, idx) => setSelDay(idx)} style={{ cursor: "pointer" }} />)}
+              <Line type="monotone" dataKey="DemandMU" stroke={C.demandLine} strokeWidth={2} dot={{ r: 2.5, fill: C.demandLine, stroke: C.base, strokeWidth: 1 }} name="Demand MU" />
+            </ComposedChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+
+      {/* ── Daily average MW curves ── */}
+      {showDailyCharts && (
+        <div>
+          <div style={{ ...lbl, fontSize: 10, color: C.t2, marginBottom: 4 }}>DAILY AVERAGE MW — DEMAND vs SUPPLY</div>
+          <ResponsiveContainer width="100%" height={200}>
+            <ComposedChart data={rows} margin={{ top: 10, right: 10, bottom: 5, left: 10 }}>
+              <CartesianGrid stroke={C.brd + "66"} strokeDasharray="3 3" />
+              <XAxis dataKey="lbl" tick={{ fill: C.t2, fontSize: 9 }} angle={-45} textAnchor="end" height={50} />
+              <YAxis tick={{ fill: C.t2, fontSize: 10 }} label={{ value: "MW", angle: -90, position: "insideLeft", fill: C.t2, fontSize: 10 }} />
+              <Tooltip contentStyle={ttStyle} />
+              <Legend wrapperStyle={{ fontSize: 10 }} />
+              <Line type="monotone" dataKey="DemandAvgMW" stroke={C.demandLine} strokeWidth={2} dot={{ r: 2.5 }} name="Demand Avg MW" />
+              <Line type="monotone" dataKey="SupplyAvgMW" stroke={C.pos} strokeWidth={2} dot={{ r: 2.5 }} name="Supply Avg MW" />
+              <Line type="monotone" dataKey="PeakMW" stroke={C.warn} strokeWidth={1.5} strokeDasharray="4 3" dot={{ r: 2 }} name="Peak MW" />
+            </ComposedChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+
+      {/* ── Day selector for 96-block drill-down ── */}
+      {showDailyCharts && (
+        <div>
+          <div style={{ ...lbl, fontSize: 10, color: C.t2, marginBottom: 4 }}>SELECT A DAY FOR 96-BLOCK DETAIL — <span style={{ color: C.focus }}>click a bar above or a day chip below</span></div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 3 }}>
+            {rows.map((r, i) => (
+              <button key={i} onClick={() => setSelDay(i)} style={{
+                ...mono, fontSize: 9, padding: "3px 6px", borderRadius: 3, cursor: "pointer",
+                border: selDay === i ? `2px solid ${C.focus}` : `1px solid ${C.brd}88`,
+                background: selDay === i ? C.focus + "25" : r.isWeekend ? C.warn + "12" : C.elev,
+                color: selDay === i ? C.focus : C.t1, fontWeight: selDay === i ? 700 : 400,
+              }}>{r.day}<span style={{ fontSize: 8, color: C.t3, marginLeft: 2 }}>{r.dow.slice(0, 2)}</span></button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── FN aggregation view ── */}
+      {fnRows.length > 0 && (
+        <div>
+          <div style={{ ...lbl, fontSize: 10, color: C.t2, marginBottom: 4 }}>{isFN ? "FORTNIGHTLY" : isMO ? "MONTHLY" : "FORTNIGHTLY"} ENERGY SUMMARY</div>
+          <ResponsiveContainer width="100%" height={180}>
+            <ComposedChart data={isMO && moSummary ? [moSummary] : fnRows} margin={{ top: 10, right: 10, bottom: 5, left: 10 }}>
+              <CartesianGrid stroke={C.brd + "66"} strokeDasharray="3 3" />
+              <XAxis dataKey="lbl" tick={{ fill: C.t2, fontSize: 10 }} />
+              <YAxis tick={{ fill: C.t2, fontSize: 10 }} label={{ value: "MU", angle: -90, position: "insideLeft", fill: C.t2, fontSize: 10 }} />
+              <Tooltip contentStyle={ttStyle} formatter={(v, name) => [typeof v === "number" ? v.toFixed(2) : v, name]} />
+              <Legend wrapperStyle={{ fontSize: 10 }} iconType="square" />
+              {segs.map((seg, si) => <Bar key={seg} dataKey={seg} stackId="s" fill={SEG_CLR[seg] || C.t3} fillOpacity={0.9} radius={si === segs.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />)}
+              <Line type="monotone" dataKey="DemandMU" stroke={C.demandLine} strokeWidth={2} dot={{ r: 3 }} name="Demand MU" />
+            </ComposedChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+
+      {/* ── Daily summary table ── */}
+      <div style={{ overflow: "auto", border: `1px solid ${C.brd}`, borderRadius: 4 }}>
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead><tr>
+            {["Day", "DoW", "Peak MW", "Dem MU", "Avg MW", "Sup MU", "Sup MW", "Def MU", "Sur MU", "Curt MU", "Uns MU", "Cost Cr", "Rs/kWh"].map((h, i) => (
+              <th key={i} style={{ ...thS, textAlign: i < 2 ? "left" : "right", position: "sticky", top: 0, zIndex: 1 }}>{h}</th>
+            ))}
+          </tr></thead>
+          <tbody>{rows.map((r, ri) => (
+            <tr key={ri} onClick={() => setSelDay(ri)} style={{ background: selDay === ri ? C.focus + "18" : r.isWeekend ? C.overlay + "88" : ri % 2 === 0 ? C.elev : C.elev + "99", cursor: "pointer" }}>
+              <td style={{ ...tdS, textAlign: "left", color: selDay === ri ? C.focus : C.t1, fontWeight: selDay === ri ? 700 : 400 }}>{r.lbl}</td>
+              <td style={{ ...tdS, textAlign: "left", color: r.isWeekend ? C.warn : C.t2 }}>{r.dow}</td>
+              <td style={{ ...tdS, color: C.warn }}>{r.PeakMW}</td>
+              <td style={{ ...tdS, color: C.warn, fontWeight: 600 }}>{r.DemandMU.toFixed(2)}</td>
+              <td style={{ ...tdS, color: C.t1 }}>{r.DemandAvgMW}</td>
+              <td style={{ ...tdS, color: C.pos, fontWeight: 600 }}>{r.SupplyMU.toFixed(2)}</td>
+              <td style={{ ...tdS, color: C.t1 }}>{r.SupplyAvgMW}</td>
+              <td style={{ ...tdS, color: r.DefMU > 0 ? C.neg : C.t3 }}>{r.DefMU.toFixed(2)}</td>
+              <td style={{ ...tdS, color: r.SurMU > 0 ? C.pos : C.t3 }}>{r.SurMU.toFixed(2)}</td>
+              <td style={{ ...tdS, color: r.CurtailMU > 0 ? C.curtail : C.t3 }}>{r.CurtailMU.toFixed(2)}</td>
+              <td style={{ ...tdS, color: r.UnsMU > 0 ? C.neg : C.t3, fontWeight: r.UnsMU > 0 ? 700 : 400 }}>{r.UnsMU.toFixed(2)}</td>
+              <td style={{ ...tdS, color: C.neg }}>{r.CostCr.toFixed(2)}</td>
+              <td style={{ ...tdS, color: C.thermal }}>{r.AvgCost}</td>
+            </tr>
+          ))}</tbody>
+          {/* FN subtotals */}
+          {fnRows.map((fn, fi) => (
+            <tfoot key={fi}><tr style={{ background: C.overlay }}>
+              <td colSpan={2} style={{ ...lbl, fontSize: 9, padding: "5px 5px", borderTop: fi === 0 ? `2px solid ${C.brd}` : `1px solid ${C.brd}`, color: C.focus }}>{fn.lbl}</td>
+              <td style={{ ...tdS, borderTop: fi === 0 ? `2px solid ${C.brd}` : `1px solid ${C.brd}`, color: C.warn, fontWeight: 700 }}>{fn.PeakMW}</td>
+              <td style={{ ...tdS, borderTop: fi === 0 ? `2px solid ${C.brd}` : `1px solid ${C.brd}`, color: C.warn, fontWeight: 700 }}>{fn.DemandMU.toFixed(1)}</td>
+              <td style={{ ...tdS, borderTop: fi === 0 ? `2px solid ${C.brd}` : `1px solid ${C.brd}`, color: C.t1 }}>{fn.DemandAvgMW}</td>
+              <td style={{ ...tdS, borderTop: fi === 0 ? `2px solid ${C.brd}` : `1px solid ${C.brd}`, color: C.pos, fontWeight: 700 }}>{fn.SupplyMU.toFixed(1)}</td>
+              <td style={{ ...tdS, borderTop: fi === 0 ? `2px solid ${C.brd}` : `1px solid ${C.brd}`, color: C.t1 }}>{fn.SupplyAvgMW}</td>
+              <td style={{ ...tdS, borderTop: fi === 0 ? `2px solid ${C.brd}` : `1px solid ${C.brd}`, color: C.neg }}>{fn.DefMU}</td>
+              <td style={{ ...tdS, borderTop: fi === 0 ? `2px solid ${C.brd}` : `1px solid ${C.brd}`, color: C.pos }}>{fn.SurMU}</td>
+              <td style={{ ...tdS, borderTop: fi === 0 ? `2px solid ${C.brd}` : `1px solid ${C.brd}`, color: C.curtail }}>{fn.CurtailMU}</td>
+              <td style={{ ...tdS, borderTop: fi === 0 ? `2px solid ${C.brd}` : `1px solid ${C.brd}`, color: C.neg }}>{fn.UnsMU}</td>
+              <td style={{ ...tdS, borderTop: fi === 0 ? `2px solid ${C.brd}` : `1px solid ${C.brd}`, color: C.neg, fontWeight: 700 }}>{fn.CostCr}</td>
+              <td style={{ ...tdS, borderTop: fi === 0 ? `2px solid ${C.brd}` : `1px solid ${C.brd}`, color: C.thermal }}>{fn.AvgCost}</td>
+            </tr></tfoot>
+          ))}
+          {/* Monthly total */}
+          {moSummary && (
+            <tfoot><tr style={{ background: C.peak }}>
+              <td colSpan={2} style={{ ...lbl, fontSize: 10, padding: "6px 5px", borderTop: `2px solid ${C.focus}`, color: C.focus, fontWeight: 700 }}>MONTH ({moSummary.days}d)</td>
+              <td style={{ ...tdS, borderTop: `2px solid ${C.focus}`, color: C.warn, fontWeight: 700 }}>{moSummary.PeakMW}</td>
+              <td style={{ ...tdS, borderTop: `2px solid ${C.focus}`, color: C.warn, fontWeight: 700 }}>{moSummary.DemandMU.toFixed(1)}</td>
+              <td style={{ ...tdS, borderTop: `2px solid ${C.focus}`, color: C.t1, fontWeight: 700 }}>{moSummary.DemandAvgMW}</td>
+              <td style={{ ...tdS, borderTop: `2px solid ${C.focus}`, color: C.pos, fontWeight: 700 }}>{moSummary.SupplyMU.toFixed(1)}</td>
+              <td style={{ ...tdS, borderTop: `2px solid ${C.focus}`, color: C.t1, fontWeight: 700 }}>{moSummary.SupplyAvgMW}</td>
+              <td style={{ ...tdS, borderTop: `2px solid ${C.focus}`, color: C.neg, fontWeight: 700 }}>{moSummary.DefMU}</td>
+              <td style={{ ...tdS, borderTop: `2px solid ${C.focus}`, color: C.pos, fontWeight: 700 }}>{moSummary.SurMU}</td>
+              <td style={{ ...tdS, borderTop: `2px solid ${C.focus}`, color: C.curtail }}>{moSummary.CurtailMU}</td>
+              <td style={{ ...tdS, borderTop: `2px solid ${C.focus}`, color: C.neg }}>{moSummary.UnsMU}</td>
+              <td style={{ ...tdS, borderTop: `2px solid ${C.focus}`, color: C.neg, fontWeight: 700 }}>{moSummary.CostCr}</td>
+              <td style={{ ...tdS, borderTop: `2px solid ${C.focus}`, color: C.thermal, fontWeight: 700 }}>{moSummary.AvgCost}</td>
+            </tr></tfoot>
+          )}
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function MeritTable({ data, plants, days }) {
   const rows = useMemo(() => {
     if (!data || !data.length) return [];
@@ -2101,6 +2668,513 @@ function PriceChart({ data, res }) {
           <Line type="monotone" dataKey="marginal" stroke={C.thermal} strokeWidth={2} dot={false} name="Marginal Cost" />
         </LineChart>
       </ResponsiveContainer>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+//  MARKET QUANTUM — block-wise MW curves for DAM/GDAM/RTM
+// ══════════════════════════════════════════════════════════════
+function MarketQuantumChart({ data, res, mkt }) {
+  const cd = useMemo(() => {
+    if (!data || !data.length) return [];
+    const src = res === "15min" ? data : aggHourly(data);
+    return src.map((b, i) => ({
+      lbl: res === "15min" ? (TB[i] ? TB[i].lbl : i) : `${String(b.h != null ? b.h : i).padStart(2, "0")}:00`,
+      DAM: b.mktDAM || 0, GDAM: b.mktGDAM || 0, RTM: b.mktRTM || 0,
+      Sell: -(b.mktSell || b.sur || 0),
+      Total: (b.mktDAM || 0) + (b.mktGDAM || 0) + (b.mktRTM || 0),
+    }));
+  }, [data, res]);
+  return (
+    <div>
+      <ResponsiveContainer width="100%" height={220}>
+        <ComposedChart data={cd} margin={{ top: 5, right: 30, bottom: 5, left: 5 }}>
+          <CartesianGrid stroke={C.brd + "66"} strokeDasharray="3 3" />
+          <XAxis dataKey="lbl" tick={{ fill: C.t2, fontSize: 10 }} interval={res === "15min" ? 7 : 1} />
+          <YAxis tick={{ fill: C.t2, fontSize: 10 }} orientation="right" label={{ value: "MW", angle: -90, position: "insideRight", style: { fill: C.t3, fontSize: 10 } }} />
+          <Tooltip contentStyle={ttStyle} formatter={(v, name) => [Math.abs(v) + " MW", name === "Sell" ? "Surplus Sold" : name + " Buy"]} />
+          <Legend wrapperStyle={{ fontSize: 10 }} />
+          <Area type="monotone" dataKey="DAM" stackId="buy" fill={C.dam + "55"} stroke={C.dam} strokeWidth={1.5} name="DAM" />
+          <Area type="monotone" dataKey="GDAM" stackId="buy" fill={C.gdam + "55"} stroke={C.gdam} strokeWidth={1.5} name="GDAM" />
+          <Area type="monotone" dataKey="RTM" stackId="buy" fill={C.rtm + "55"} stroke={C.rtm} strokeWidth={1.5} name="RTM" />
+          <Area type="monotone" dataKey="Sell" fill={C.pos + "33"} stroke={C.pos} strokeWidth={1.5} name="Sell" />
+          {mkt && <ReferenceLine y={mkt.damLim} stroke={C.dam} strokeDasharray="6 3" label={{ value: `DAM ${mkt.damLim}`, fill: C.dam, fontSize: 9, position: "right" }} />}
+          {mkt && <ReferenceLine y={mkt.gdamLim} stroke={C.gdam} strokeDasharray="6 3" label={{ value: `GDAM ${mkt.gdamLim}`, fill: C.gdam, fontSize: 9, position: "insideTopRight" }} />}
+          {mkt && <ReferenceLine y={mkt.rtmLim} stroke={C.rtm} strokeDasharray="6 3" label={{ value: `RTM ${mkt.rtmLim}`, fill: C.rtm, fontSize: 9, position: "insideBottomRight" }} />}
+        </ComposedChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+//  MARKET BREAKUP — segment volume, wtd avg cost/price
+// ══════════════════════════════════════════════════════════════
+function MarketBreakup({ data, days }) {
+  const bp = useMemo(() => {
+    if (!data || !data.length) return null;
+    let damMWh = 0, gdamMWh = 0, rtmMWh = 0, sellMWh = 0;
+    let damCost = 0, gdamCost = 0, rtmCost = 0, sellRev = 0;
+    data.forEach(b => {
+      const h = 0.25;
+      const dm = b.mktDAM || 0, gm = b.mktGDAM || 0, rm = b.mktRTM || 0;
+      const sl = b.mktSell || b.sur || 0;
+      damMWh += dm * h; gdamMWh += gm * h; rtmMWh += rm * h; sellMWh += sl * h;
+      damCost += dm * (b.damRate || 0) * h;
+      gdamCost += gm * (b.gdamRate || 0) * h;
+      rtmCost += rm * (b.rtmRate || 0) * h;
+      sellRev += sl * (b.damRate || 0) * h;
+    });
+    const f = days / 1000; // MWh per representative day → MU for month
+    const totalBuyMU = (damMWh + gdamMWh + rtmMWh) * f;
+    const segs = [
+      { seg: "DAM", mu: +(damMWh * f).toFixed(2), pct: totalBuyMU > 0 ? +((damMWh / (damMWh + gdamMWh + rtmMWh)) * 100).toFixed(1) : 0, wtdCost: damMWh > 0 ? +(damCost / damMWh).toFixed(2) : 0, color: C.dam },
+      { seg: "GDAM", mu: +(gdamMWh * f).toFixed(2), pct: totalBuyMU > 0 ? +((gdamMWh / (damMWh + gdamMWh + rtmMWh)) * 100).toFixed(1) : 0, wtdCost: gdamMWh > 0 ? +(gdamCost / gdamMWh).toFixed(2) : 0, color: C.gdam },
+      { seg: "RTM", mu: +(rtmMWh * f).toFixed(2), pct: totalBuyMU > 0 ? +((rtmMWh / (damMWh + gdamMWh + rtmMWh)) * 100).toFixed(1) : 0, wtdCost: rtmMWh > 0 ? +(rtmCost / rtmMWh).toFixed(2) : 0, color: C.rtm },
+    ];
+    return {
+      segs, totalBuyMU: +totalBuyMU.toFixed(2),
+      sellMU: +(sellMWh * f).toFixed(2),
+      wtdSellPrice: sellMWh > 0 ? +(sellRev / sellMWh).toFixed(2) : 0,
+      wtdBuyCost: (damMWh + gdamMWh + rtmMWh) > 0 ? +((damCost + gdamCost + rtmCost) / (damMWh + gdamMWh + rtmMWh)).toFixed(2) : 0,
+    };
+  }, [data, days]);
+
+  if (!bp) return null;
+
+  const cellS = { ...mono, fontSize: 11, padding: "5px 8px", textAlign: "right", borderBottom: `1px solid ${C.brd}33` };
+  const hdrS = { ...lbl, fontSize: 10, padding: "5px 8px", textAlign: "right", borderBottom: `1px solid ${C.brd}`, color: C.t3, letterSpacing: "0.05em" };
+  const barMax = Math.max(...bp.segs.map(s => s.mu), 0.01);
+
+  return (
+    <div style={{ overflowX: "auto" }}>
+      <table style={{ width: "100%", borderCollapse: "collapse", marginBottom: 10 }}>
+        <thead>
+          <tr>
+            <th style={{ ...hdrS, textAlign: "left", width: 80 }}>SEGMENT</th>
+            <th style={{ ...hdrS, width: 100 }}>VOLUME</th>
+            <th style={{ ...hdrS, width: 70 }}>SHARE</th>
+            <th style={{ ...hdrS, width: 110 }}>WTD AVG COST</th>
+            <th style={hdrS}>ALLOCATION</th>
+          </tr>
+        </thead>
+        <tbody>
+          {bp.segs.map(s => (
+            <tr key={s.seg}>
+              <td style={{ ...cellS, textAlign: "left", fontWeight: 700, color: s.color }}>{s.seg}</td>
+              <td style={cellS}>{s.mu} MU</td>
+              <td style={cellS}>{s.pct}%</td>
+              <td style={cellS}>{s.wtdCost} Rs/kWh</td>
+              <td style={{ ...cellS, padding: "5px 8px" }}>
+                <div style={{ height: 14, background: C.brd + "33", borderRadius: 2, overflow: "hidden" }}>
+                  <div style={{ height: "100%", width: `${(s.mu / barMax) * 100}%`, background: s.color + "88", borderRadius: 2, transition: "width 0.3s" }} />
+                </div>
+              </td>
+            </tr>
+          ))}
+          <tr style={{ borderTop: `2px solid ${C.brd}` }}>
+            <td style={{ ...cellS, textAlign: "left", fontWeight: 700, color: C.t1 }}>TOTAL BUY</td>
+            <td style={{ ...cellS, fontWeight: 700 }}>{bp.totalBuyMU} MU</td>
+            <td style={cellS}>100%</td>
+            <td style={{ ...cellS, fontWeight: 700 }}>{bp.wtdBuyCost} Rs/kWh</td>
+            <td style={cellS} />
+          </tr>
+          {bp.sellMU > 0 && (
+            <tr>
+              <td style={{ ...cellS, textAlign: "left", fontWeight: 700, color: C.pos }}>SURPLUS SOLD</td>
+              <td style={{ ...cellS, color: C.pos }}>{bp.sellMU} MU</td>
+              <td style={cellS} />
+              <td style={{ ...cellS, color: C.pos }}>{bp.wtdSellPrice} Rs/kWh</td>
+              <td style={cellS} />
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+//  UC SIMULATION — shutdown/surrender economics
+// ══════════════════════════════════════════════════════════════
+function UCSimTab({ plants, months, demand, demandMU, stoa, mkt, fdre, uploaded96, startMo }) {
+  // ── state ──
+  const [ucSel, setUcSel] = useState({}); // { plantId: true }
+  const [ucFrom, setUcFrom] = useState("");
+  const [ucTo, setUcTo] = useState("");
+  const [ucResult, setUcResult] = useState(null);
+
+  // Derive calendar year from startMo
+  const now = new Date();
+  const baseYear = startMo <= now.getMonth() ? now.getFullYear() : now.getFullYear();
+
+  // Build date bounds from the 12-month planning horizon
+  const firstDate = `${baseYear}-${String(startMo + 1).padStart(2, "0")}-01`;
+  const lastMo = (startMo + 11) % 12;
+  const lastYear = lastMo < startMo ? baseYear + 1 : baseYear;
+  const lastDate = `${lastYear}-${String(lastMo + 1).padStart(2, "0")}-${CAL_DAYS[lastMo]}`;
+
+  const [ucDropOpen, setUcDropOpen] = useState(false);
+  const ucDropRef = useRef(null);
+  const togglePlant = (id) => setUcSel(prev => ({ ...prev, [id]: !prev[id] }));
+  const selPlants = plants.filter(p => ucSel[p.id]);
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    if (!ucDropOpen) return;
+    const handler = (e) => { if (ucDropRef.current && !ucDropRef.current.contains(e.target)) setUcDropOpen(false); };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [ucDropOpen]);
+
+  // ── Run simulation ──
+  const runSim = useCallback(() => {
+    if (!ucFrom || !ucTo || selPlants.length === 0) return;
+    const d0 = new Date(ucFrom), d1 = new Date(ucTo);
+    if (d1 <= d0) return;
+    const outDays = Math.round((d1 - d0) / 86400000) + 1;
+
+    // Identify which planning months are affected
+    const affectedMonths = [];
+    for (let d = new Date(d0); d <= d1; ) {
+      const cm = d.getMonth();
+      const mi = months.findIndex(m => m.cal === cm);
+      if (mi >= 0 && !affectedMonths.find(a => a.mi === mi)) {
+        // How many outage days fall in this calendar month?
+        const moStart = new Date(d.getFullYear(), cm, 1);
+        const moEnd = new Date(d.getFullYear(), cm + 1, 0);
+        const effFrom = d0 > moStart ? d0 : moStart;
+        const effTo = d1 < moEnd ? d1 : moEnd;
+        const daysInOutage = Math.round((effTo - effFrom) / 86400000) + 1;
+        affectedMonths.push({ mi, cal: cm, days: months[mi].days, outageDays: daysInOutage });
+      }
+      d.setDate(d.getDate() + 1);
+    }
+
+    // For each affected month: run baseline dispatch + counterfactual (plants forced off)
+    const plantResults = {};
+    selPlants.forEach(p => { plantResults[p.id] = { name: p.name, type: p.type, pMax: p.pMax, ecr: p.ecr, startCost: p.startCost || 0, savedVarCostLk: 0, replaceCostLk: 0, gapBlocks: [], baselineBlocks: [] }; });
+
+    let allGapBlocks = []; // block-wise supply-demand gap across outage
+
+    affectedMonths.forEach(am => {
+      // Baseline dispatch (all plants on)
+      const baseB96 = dispatch96(plants, demand[am.cal], am.cal, stoa, mkt, fdre, {}, am.cal, am.days, uploaded96, demandMU[am.cal] || 0);
+      // Counterfactual: selected plants forced off (pMax = 0)
+      const modPlants = plants.map(p => ucSel[p.id] ? { ...p, pMax: 0, avail: 0 } : p);
+      const cfB96 = dispatch96(modPlants, demand[am.cal], am.cal, stoa, mkt, fdre, {}, am.cal, am.days, uploaded96, demandMU[am.cal] || 0);
+
+      const outageFrac = am.outageDays / am.days; // fraction of month under outage
+
+      // Per-block analysis
+      baseB96.forEach((bb, t) => {
+        const cb = cfB96[t];
+        // Supply-demand gap: additional unserved or market purchase in counterfactual
+        const baseGap = (bb.mktDAM || 0) + (bb.mktGDAM || 0) + (bb.mktRTM || 0) + (bb.unserved || 0);
+        const cfGap = (cb.mktDAM || 0) + (cb.mktGDAM || 0) + (cb.mktRTM || 0) + (cb.unserved || 0);
+        const addlGap = cfGap - baseGap; // additional MW needed from market
+
+        allGapBlocks.push({
+          t, lbl: TB[t] ? TB[t].lbl : t,
+          mo: months[am.mi].name, outageFrac,
+          baseDem: bb.dem, baseGen: bb.gen, cfGen: cb.gen,
+          baseDeficit: bb.def || 0, cfDeficit: cb.def || 0,
+          addlGap: Math.round(addlGap),
+          baseUnserved: bb.unserved || 0, cfUnserved: cb.unserved || 0,
+          damRate: bb.damRate || 0,
+        });
+
+        // Per-plant economics
+        selPlants.forEach(p => {
+          const baseMW = bb.src[p.id] ? Math.max(0, bb.src[p.id].mw) : 0;
+          const baseECR = bb.src[p.id] ? bb.src[p.id].ecr : p.ecr;
+          if (baseMW > 0) {
+            // Variable cost saved: per-block cost × outage days in this month
+            // (representative-day cost × actual outage days, not fraction)
+            const savedLk = baseMW * baseECR * 0.25 * 10 / 1000 * am.outageDays;
+            plantResults[p.id].savedVarCostLk += savedLk;
+            // Replacement cost: the additional gap × DAM rate × outage days
+            const replaceLk = baseMW * (bb.damRate || 0) * 0.25 * 10 / 1000 * am.outageDays;
+            plantResults[p.id].replaceCostLk += replaceLk;
+          }
+        });
+      });
+    });
+
+    // Compute per-plant summary
+    const plantSummary = selPlants.map(p => {
+      const r = plantResults[p.id];
+      const savedCr = +(r.savedVarCostLk / 100).toFixed(2);
+      const replaceCr = +(r.replaceCostLk / 100).toFixed(2);
+      const startupCostCr = +((r.startCost || 0) / 100).toFixed(3); // ₹ lakhs → Cr (1 Cr = 100 lakhs)
+      const netBenefitCr = +(savedCr - replaceCr - startupCostCr).toFixed(2);
+      // Rs/MWh: net benefit per MWh of plant capacity over the outage period
+      const outageHrs = outDays * 24;
+      const plantMWh = r.pMax * outageHrs;
+      const netRsMWh = plantMWh > 0 ? +(netBenefitCr * 10000000 / plantMWh).toFixed(0) : 0; // Cr × 10⁷ / MWh = Rs/MWh
+      return { ...r, savedCr, replaceCr, startupCostCr, netBenefitCr, netRsMWh, outDays };
+    });
+
+    setUcResult({ plantSummary, gapBlocks: allGapBlocks, outDays, ucFrom, ucTo });
+  }, [plants, selPlants, ucSel, ucFrom, ucTo, months, demand, demandMU, stoa, mkt, fdre, uploaded96]);
+
+  const cellS = { ...mono, fontSize: 11, padding: "5px 8px", textAlign: "right", borderBottom: `1px solid ${C.brd}33` };
+  const hdrS = { ...lbl, fontSize: 10, padding: "5px 8px", textAlign: "right", borderBottom: `1px solid ${C.brd}`, color: C.t3, letterSpacing: "0.05em" };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      {/* ── Plant selector dropdown ── */}
+      <Panel title="SELECT PLANTS FOR SHUTDOWN / SURRENDER" accent={C.warn}>
+        <div ref={ucDropRef} style={{ position: "relative" }}>
+          {/* Dropdown trigger */}
+          <div onClick={() => setUcDropOpen(!ucDropOpen)} style={{
+            display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", minHeight: 34,
+            padding: "4px 10px", border: `1px solid ${ucDropOpen ? C.warn : C.brd}`, borderRadius: 2,
+            background: C.overlay, cursor: "pointer", transition: "border-color 0.15s",
+          }}>
+            {selPlants.length === 0 && <span style={{ ...ui, fontSize: 12, color: C.t3 }}>Click to select plants...</span>}
+            {selPlants.map(p => (
+              <span key={p.id} style={{
+                display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 8px 2px 6px",
+                borderRadius: 2, background: C.warn + "18", border: `1px solid ${C.warn}44`, fontSize: 11, ...lbl, color: C.warn,
+              }}>
+                <span style={{ width: 6, height: 6, borderRadius: 1, background: FC[p.type] || C.t3, flexShrink: 0 }} />
+                {p.name}
+                <span onClick={e => { e.stopPropagation(); togglePlant(p.id); }} style={{ marginLeft: 2, cursor: "pointer", fontSize: 13, lineHeight: 1, color: C.warn + "88" }}>×</span>
+              </span>
+            ))}
+            <span style={{ marginLeft: "auto", fontSize: 10, color: C.t3, flexShrink: 0, transform: ucDropOpen ? "rotate(180deg)" : "rotate(0deg)", transition: "transform 0.15s" }}>▾</span>
+          </div>
+
+          {/* Dropdown panel */}
+          {ucDropOpen && (
+            <div style={{
+              position: "absolute", top: "100%", left: 0, right: 0, zIndex: 30,
+              background: C.elev, border: `1px solid ${C.warn}44`, borderTop: "none", borderRadius: "0 0 2px 2px",
+              maxHeight: 280, overflowY: "auto", boxShadow: `0 6px 20px rgba(0,0,0,0.4)`,
+            }}>
+              {/* Quick actions */}
+              <div style={{ display: "flex", gap: 6, padding: "6px 10px", borderBottom: `1px solid ${C.brd}`, background: C.overlay }}>
+                <button onClick={() => { const all = {}; plants.forEach(p => { all[p.id] = true; }); setUcSel(all); }}
+                  style={{ ...lbl, fontSize: 9, padding: "2px 8px", borderRadius: 2, border: `1px solid ${C.brd}`, background: C.panel, color: C.t2, cursor: "pointer" }}>SELECT ALL</button>
+                <button onClick={() => setUcSel({})}
+                  style={{ ...lbl, fontSize: 9, padding: "2px 8px", borderRadius: 2, border: `1px solid ${C.brd}`, background: C.panel, color: C.t2, cursor: "pointer" }}>CLEAR</button>
+                <span style={{ ...mono, fontSize: 10, color: C.t3, marginLeft: "auto" }}>{selPlants.length} / {plants.length}</span>
+              </div>
+              {plants.map(p => (
+                <div key={p.id} onClick={() => togglePlant(p.id)} style={{
+                  display: "flex", alignItems: "center", gap: 8, padding: "5px 10px", cursor: "pointer",
+                  background: ucSel[p.id] ? C.warn + "0C" : "transparent",
+                  borderLeft: `3px solid ${ucSel[p.id] ? C.warn : "transparent"}`,
+                }}>
+                  <div style={{ width: 14, height: 14, borderRadius: 2, border: `1.5px solid ${ucSel[p.id] ? C.warn : C.brd}`, background: ucSel[p.id] ? C.warn : "transparent", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                    {ucSel[p.id] && <span style={{ color: "#fff", fontSize: 9, fontWeight: 700 }}>✓</span>}
+                  </div>
+                  <span style={{ width: 6, height: 6, borderRadius: 1, background: FC[p.type] || C.t3, flexShrink: 0 }} />
+                  <span style={{ ...ui, fontSize: 12, color: C.t1, flex: 1 }}>{p.name}</span>
+                  <span style={{ ...mono, fontSize: 10, color: C.t3 }}>{p.type} | {p.pMax} MW | {p.ecr} Rs</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </Panel>
+
+      {/* ── Date range ── */}
+      <Panel title="OUTAGE PERIOD" accent={C.focus}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <label style={{ ...lbl, fontSize: 10, color: C.t3 }}>FROM
+            <input type="date" value={ucFrom} min={firstDate} max={lastDate} onChange={e => setUcFrom(e.target.value)}
+              style={{ ...mono, fontSize: 12, marginLeft: 6, background: C.overlay, color: C.t1, border: `1px solid ${C.brd}`, borderRadius: 2, padding: "3px 6px" }} />
+          </label>
+          <label style={{ ...lbl, fontSize: 10, color: C.t3 }}>TO
+            <input type="date" value={ucTo} min={ucFrom || firstDate} max={lastDate} onChange={e => setUcTo(e.target.value)}
+              style={{ ...mono, fontSize: 12, marginLeft: 6, background: C.overlay, color: C.t1, border: `1px solid ${C.brd}`, borderRadius: 2, padding: "3px 6px" }} />
+          </label>
+          <span style={{ ...mono, fontSize: 11, color: C.t2 }}>
+            {ucFrom && ucTo && new Date(ucTo) >= new Date(ucFrom)
+              ? `${Math.round((new Date(ucTo) - new Date(ucFrom)) / 86400000) + 1} days`
+              : ""}
+          </span>
+          <button onClick={runSim} disabled={!ucFrom || !ucTo || selPlants.length === 0}
+            style={{ ...lbl, fontSize: 11, padding: "5px 16px", borderRadius: 2, border: `1px solid ${C.focus}`, background: selPlants.length > 0 && ucFrom && ucTo ? C.focus : C.brd, color: selPlants.length > 0 && ucFrom && ucTo ? "#fff" : C.t3, cursor: selPlants.length > 0 && ucFrom && ucTo ? "pointer" : "not-allowed", fontWeight: 700 }}>
+            RUN SIMULATION
+          </button>
+          <span style={{ ...mono, fontSize: 10, color: C.t3 }}>
+            {selPlants.length} plant{selPlants.length !== 1 ? "s" : ""} selected
+          </span>
+        </div>
+      </Panel>
+
+      {/* ── Results ── */}
+      {ucResult && (
+        <>
+          <Panel title={`SHUTDOWN ECONOMICS — ${ucResult.ucFrom} to ${ucResult.ucTo} (${ucResult.outDays} days)`} accent={C.warn}>
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                <thead>
+                  <tr>
+                    <th style={{ ...hdrS, textAlign: "left", minWidth: 120 }}>PLANT</th>
+                    <th style={{ ...hdrS, minWidth: 60 }}>TYPE</th>
+                    <th style={{ ...hdrS, minWidth: 60 }}>MW</th>
+                    <th style={{ ...hdrS, minWidth: 70 }}>ECR Rs/kWh</th>
+                    <th style={{ ...hdrS, minWidth: 80 }}>VAR COST SAVED</th>
+                    <th style={{ ...hdrS, minWidth: 80 }}>REPLACE COST (DAM)</th>
+                    <th style={{ ...hdrS, minWidth: 70 }}>STARTUP COST</th>
+                    <th style={{ ...hdrS, minWidth: 80 }}>NET BENEFIT</th>
+                    <th style={{ ...hdrS, minWidth: 70 }}>Rs/MWh</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {ucResult.plantSummary.map(p => (
+                    <tr key={p.name}>
+                      <td style={{ ...cellS, textAlign: "left", fontWeight: 600, color: C.t1 }}>{p.name}</td>
+                      <td style={{ ...cellS, color: FC[p.type] || C.t2 }}>{p.type}</td>
+                      <td style={cellS}>{p.pMax}</td>
+                      <td style={cellS}>{p.ecr}</td>
+                      <td style={{ ...cellS, color: C.pos }}>{p.savedCr} Cr</td>
+                      <td style={{ ...cellS, color: C.neg }}>{p.replaceCr} Cr</td>
+                      <td style={{ ...cellS, color: C.warn }}>{p.startupCostCr} Cr</td>
+                      <td style={{ ...cellS, fontWeight: 700, color: p.netBenefitCr >= 0 ? C.pos : C.neg }}>{p.netBenefitCr} Cr</td>
+                      <td style={{ ...cellS, fontWeight: 700, color: p.netRsMWh >= 0 ? C.pos : C.neg }}>{p.netRsMWh}</td>
+                    </tr>
+                  ))}
+                  {ucResult.plantSummary.length > 1 && (
+                    <tr style={{ borderTop: `2px solid ${C.brd}` }}>
+                      <td style={{ ...cellS, textAlign: "left", fontWeight: 700 }} colSpan={4}>TOTAL</td>
+                      <td style={{ ...cellS, fontWeight: 700, color: C.pos }}>{ucResult.plantSummary.reduce((s, p) => s + p.savedCr, 0).toFixed(2)} Cr</td>
+                      <td style={{ ...cellS, fontWeight: 700, color: C.neg }}>{ucResult.plantSummary.reduce((s, p) => s + p.replaceCr, 0).toFixed(2)} Cr</td>
+                      <td style={{ ...cellS, fontWeight: 700, color: C.warn }}>{ucResult.plantSummary.reduce((s, p) => s + p.startupCostCr, 0).toFixed(3)} Cr</td>
+                      <td style={{ ...cellS, fontWeight: 700, color: ucResult.plantSummary.reduce((s, p) => s + p.netBenefitCr, 0) >= 0 ? C.pos : C.neg }}>
+                        {ucResult.plantSummary.reduce((s, p) => s + p.netBenefitCr, 0).toFixed(2)} Cr
+                      </td>
+                      <td style={cellS} />
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+            <div style={{ ...mono, fontSize: 10, color: C.t3, marginTop: 8, padding: "4px 0", borderTop: `1px solid ${C.brd}22` }}>
+              Var Cost Saved = plant ECR × dispatched MW × outage hours. Replace Cost = additional market purchase at block DAM MCP.
+              Startup Cost = one re-start per plant after outage ends. Net Benefit = Saved − Replace − Startup. Positive = shutdown is economical.
+            </div>
+          </Panel>
+
+          {/* ── Block-wise supply-demand gap ── */}
+          <Panel title="BLOCK-WISE SUPPLY-DEMAND GAP (representative day)" accent={C.info}>
+            {(() => {
+              // Show one representative day (averaged across affected months, weighted by outageFrac)
+              const byBlock = {};
+              ucResult.gapBlocks.forEach(g => {
+                if (!byBlock[g.t]) byBlock[g.t] = { t: g.t, lbl: g.lbl, baseDem: 0, baseGen: 0, cfGen: 0, addlGap: 0, damRate: 0, n: 0 };
+                byBlock[g.t].baseDem += g.baseDem * g.outageFrac;
+                byBlock[g.t].baseGen += g.baseGen * g.outageFrac;
+                byBlock[g.t].cfGen += g.cfGen * g.outageFrac;
+                byBlock[g.t].addlGap += g.addlGap * g.outageFrac;
+                byBlock[g.t].damRate += g.damRate * g.outageFrac;
+                byBlock[g.t].n += g.outageFrac;
+              });
+              const cd = Object.values(byBlock).sort((a, b) => a.t - b.t).map(b => ({
+                lbl: b.lbl,
+                Demand: Math.round(b.baseDem / b.n),
+                "Base Supply": Math.round(b.baseGen / b.n),
+                "Outage Supply": Math.round(b.cfGen / b.n),
+                "Addl Gap": Math.round(b.addlGap / b.n),
+              }));
+              return (
+                <div>
+                  <ResponsiveContainer width="100%" height={240}>
+                    <ComposedChart data={cd} margin={{ top: 5, right: 30, bottom: 5, left: 5 }}>
+                      <CartesianGrid stroke={C.brd + "66"} strokeDasharray="3 3" />
+                      <XAxis dataKey="lbl" tick={{ fill: C.t2, fontSize: 10 }} interval={7} />
+                      <YAxis tick={{ fill: C.t2, fontSize: 10 }} orientation="right" label={{ value: "MW", angle: -90, position: "insideRight", style: { fill: C.t3, fontSize: 10 } }} />
+                      <Tooltip contentStyle={ttStyle} />
+                      <Legend wrapperStyle={{ fontSize: 10 }} />
+                      <Line type="monotone" dataKey="Demand" stroke={C.val} strokeWidth={2} dot={false} />
+                      <Line type="monotone" dataKey="Base Supply" stroke={C.pos} strokeWidth={1.5} dot={false} strokeDasharray="6 3" />
+                      <Line type="monotone" dataKey="Outage Supply" stroke={C.neg} strokeWidth={2} dot={false} />
+                      <Bar dataKey="Addl Gap" fill={C.warn + "77"} name="Additional Gap" />
+                    </ComposedChart>
+                  </ResponsiveContainer>
+                  {/* Gap summary table */}
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 6, marginTop: 8 }}>
+                    <KPI label="Peak Addl Gap" value={Math.max(...cd.map(b => b["Addl Gap"]))} unit="MW" color={C.warn} accent={C.warn} />
+                    <KPI label="Avg Addl Gap" value={Math.round(cd.reduce((s, b) => s + b["Addl Gap"], 0) / cd.length)} unit="MW" color={C.warn} accent={C.warn} />
+                    <KPI label="Blocks w/ Gap" value={cd.filter(b => b["Addl Gap"] > 0).length} unit={`/ ${cd.length}`} color={C.info} accent={C.info} />
+                    <KPI label="Avg DAM Rate" value={(() => { const vals = Object.values(byBlock); const s = vals.reduce((a, b) => a + b.damRate, 0); const n = vals.reduce((a, b) => a + b.n, 0); return n > 0 ? (s / n).toFixed(2) : "0"; })()} unit="Rs/kWh" color={C.dam} accent={C.dam} />
+                  </div>
+                </div>
+              );
+            })()}
+          </Panel>
+        </>
+      )}
+
+      {!ucResult && (
+        <div style={{ ...mono, fontSize: 12, color: C.t3, textAlign: "center", padding: "40px 20px", background: C.overlay, borderRadius: 2, border: `1px dashed ${C.brd}` }}>
+          Select plants to take under outage, choose the date range, and click RUN SIMULATION to see shutdown economics and supply-demand gap analysis.
+          <br /><span style={{ fontSize: 10, color: C.t3 + "88" }}>This simulation is independent — it does not affect Dispatch, Balance, or other tabs.</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+//  GNA CORRIDOR UTILIZATION CHART
+// ══════════════════════════════════════════════════════════════
+function GNACorridorChart({ gnaData, res }) {
+  const cd = useMemo(() => {
+    if (!gnaData || !gnaData.length) return [];
+    if (res === "15min") return gnaData.map(g => ({ lbl: g.lbl, "LTA (GNA)": g.ltaGNA, "STOA (GNA)": g.stoaGNA, "LTA (T-GNA)": g.ltaTGNA, "STOA (T-GNA)": g.stoaTGNA, "PX (T-GNA)": g.pxMW, Headroom: g.gnaFree }));
+    // hourly aggregation
+    const hrs = [];
+    for (let h = 0; h < 24; h++) {
+      const s = gnaData.slice(h * 4, h * 4 + 4).filter(Boolean);
+      if (!s.length) continue;
+      hrs.push({
+        lbl: `${String(h).padStart(2, "0")}:00`,
+        "LTA (GNA)": Math.round(safeMean(s, g => g.ltaGNA)),
+        "STOA (GNA)": Math.round(safeMean(s, g => g.stoaGNA)),
+        "LTA (T-GNA)": Math.round(safeMean(s, g => g.ltaTGNA)),
+        "STOA (T-GNA)": Math.round(safeMean(s, g => g.stoaTGNA)),
+        "PX (T-GNA)": Math.round(safeMean(s, g => g.pxMW)),
+        Headroom: Math.round(safeMean(s, g => g.gnaFree)),
+      });
+    }
+    return hrs;
+  }, [gnaData, res]);
+
+  if (!cd.length) return null;
+  const gnaQ = gnaData[0]?.gnaQ || 0;
+  const totalTgnaCostLk = safeSum(gnaData, g => g.tgnaCostLk);
+  const peakTGNA = Math.max(...gnaData.map(g => g.totalTGNA));
+  const blocksWithTGNA = gnaData.filter(g => g.totalTGNA > 0).length;
+
+  return (
+    <div>
+      <ResponsiveContainer width="100%" height={220}>
+        <ComposedChart data={cd} margin={{ top: 5, right: 30, bottom: 5, left: 5 }}>
+          <CartesianGrid stroke={C.brd + "66"} strokeDasharray="3 3" />
+          <XAxis dataKey="lbl" tick={{ fill: C.t2, fontSize: 10 }} interval={res === "15min" ? 7 : 1} />
+          <YAxis tick={{ fill: C.t2, fontSize: 10 }} orientation="right" label={{ value: "MW", angle: -90, position: "insideRight", style: { fill: C.t3, fontSize: 10 } }} />
+          <Tooltip contentStyle={ttStyle} />
+          <Legend wrapperStyle={{ fontSize: 10 }} />
+          <Area type="monotone" dataKey="LTA (GNA)" stackId="cor" fill={C.pos + "44"} stroke={C.pos} strokeWidth={1} />
+          <Area type="monotone" dataKey="STOA (GNA)" stackId="cor" fill={C.bilat + "44"} stroke={C.bilat} strokeWidth={1} />
+          <Area type="monotone" dataKey="LTA (T-GNA)" stackId="cor" fill={C.warn + "44"} stroke={C.warn} strokeWidth={1} />
+          <Area type="monotone" dataKey="STOA (T-GNA)" stackId="cor" fill={C.warn + "22"} stroke={C.warn} strokeWidth={1} strokeDasharray="4 2" />
+          <Area type="monotone" dataKey="PX (T-GNA)" stackId="cor" fill={C.dam + "33"} stroke={C.dam} strokeWidth={1} />
+          <ReferenceLine y={gnaQ} stroke={C.pos} strokeWidth={2} strokeDasharray="8 4" label={{ value: `GNA ${gnaQ} MW`, fill: C.pos, fontSize: 10, position: "right" }} />
+        </ComposedChart>
+      </ResponsiveContainer>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 6, marginTop: 8 }}>
+        <KPI label="GNA Quantum" value={gnaQ} unit="MW" color={C.pos} accent={C.pos} />
+        <KPI label="Peak T-GNA" value={peakTGNA} unit="MW" color={C.warn} accent={C.warn} />
+        <KPI label="T-GNA Blocks" value={blocksWithTGNA} unit={`/ ${gnaData.length}`} color={C.info} accent={C.info} />
+        <KPI label="T-GNA Cost" value={(totalTgnaCostLk / 100).toFixed(2)} unit="Cr" color={C.neg} accent={C.neg} sub={`@ ${gnaData[0]?.gnaQ > 0 ? (safeSum(gnaData, g => g.tgnaCostLk) > 0 ? "T-GNA rate applied" : "No T-GNA used") : "GNA disabled"}`} />
+      </div>
     </div>
   );
 }
@@ -2687,7 +3761,7 @@ function BankingPage({ allEv, evScenario, scenarios, bankSc, setBankSc, bankProp
   );
   // Schedule-row table shared by both legs
   const schedTable = (field, color, addDef) => (
-    <div>
+    <div style={{ overflowX: "auto" }}>
       <table style={{ borderCollapse: "collapse" }}>
         <thead><tr>{["From Mo", "To Mo", "From Hr", "To Hr", "MW", ""].map((h, i) => (
           <th key={i} style={{ ...lbl, fontSize: 9, fontWeight: 700, color: C.t3, padding: "2px 6px", textAlign: i > 1 ? "right" : "left" }}>{h}</th>
@@ -3214,7 +4288,7 @@ function STOAEditor({ stoa, setStoa, moNames, months }) {
   };
   const addDeal = (seg) => {
     const id = Math.max(0, ...stoa.map(s => s.id)) + 1;
-    const base = { id, seg, name: `New ${seg} ${id}`, cpty: "", dir: "BUY", mw: 100, rate: seg === "Banking" ? 0.10 : 3.50, months: Array(12).fill(1), hrs: "RTC", status: "DRAFT" };
+    const base = { id, seg, name: `New ${seg} ${id}`, cpty: "", dir: "BUY", mw: 100, rate: seg === "Banking" ? 0.10 : 3.50, months: Array(12).fill(1), hrs: "RTC", status: "DRAFT", corridor: "GNA" };
     if (seg === "Banking") { base.injectMo = Array(12).fill(0); base.withdrawMo = Array(12).fill(0); base.lossPct = 2; base.bankRatio = 100; }
     setStoa(prev => [...prev, base]);
   };
@@ -3230,7 +4304,7 @@ function STOAEditor({ stoa, setStoa, moNames, months }) {
       })}
     </div>
   );
-  const hdrs = ["", "Name", "Cpty", "Dir", "MW", "Rate", "Hrs", "Months", "Status"];
+  const hdrs = ["", "Name", "Cpty", "Dir", "MW", "Rate", "Hrs", "Corridor", "Months", "Status"];
   const dealRow = (s) => (
     <tr key={s.id} style={{ background: s.status === "DRAFT" ? C.warn + "08" : "transparent" }}>
       <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}12` }}><button onClick={() => del(s.id)} style={{ background: "none", border: "none", color: C.neg, cursor: "pointer", fontSize: 11 }}>x</button></td>
@@ -3255,6 +4329,9 @@ function STOAEditor({ stoa, setStoa, moNames, months }) {
           )}
         </div>
       </td>
+      <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}12` }}>
+        <select value={s.corridor || "GNA"} onChange={e => update(s.id, "corridor", e.target.value)} style={{ ...ui, fontSize: 9, background: C.overlay, color: (s.corridor || "GNA") === "GNA" ? C.pos : C.warn, border: `1px solid ${C.brd}`, borderRadius: 3, padding: "2px 2px", cursor: "pointer", minWidth: 42, fontWeight: 600 }}><option value="GNA">GNA</option><option value="TGNA">T-GNA</option></select>
+      </td>
       <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}12` }}>{moChips(s, "months")}</td>
       <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}12` }}>
         <select value={s.status} onChange={e => update(s.id, "status", e.target.value)} style={{ ...ui, fontSize: 10, background: C.overlay, color: s.status === "ACTIVE" ? C.pos : C.warn, border: `1px solid ${C.brd}`, borderRadius: 3, padding: "2px 3px", cursor: "pointer" }}><option value="ACTIVE">ACTIVE</option><option value="DRAFT">DRAFT</option><option value="EXPIRED">EXPIRED</option></select>
@@ -3270,7 +4347,7 @@ function STOAEditor({ stoa, setStoa, moNames, months }) {
       <div style={{ overflow: "auto", border: `1px solid ${C.brd}`, borderRadius: 6, marginBottom: 12 }}>
         <table style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead><tr>{hdrs.map((h, i) => <th key={i} style={{ ...lbl, fontSize: 10, fontWeight: 700, color: C.t2, padding: "5px 4px", background: C.base, borderBottom: `1px solid ${C.brd}`, textAlign: i > 3 ? "right" : "left", whiteSpace: "nowrap" }}>{h}</th>)}</tr></thead>
-          <tbody>{bilateral.length === 0 ? <tr><td colSpan={9} style={{ ...ui, fontSize: 12, color: C.t3, padding: 8, textAlign: "center" }}>None</td></tr> : bilateral.map(dealRow)}</tbody>
+          <tbody>{bilateral.length === 0 ? <tr><td colSpan={10} style={{ ...ui, fontSize: 12, color: C.t3, padding: 8, textAlign: "center" }}>None</td></tr> : bilateral.map(dealRow)}</tbody>
         </table>
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6, marginTop: 8 }}>
@@ -3279,8 +4356,8 @@ function STOAEditor({ stoa, setStoa, moNames, months }) {
       </div>
       <div style={{ overflow: "auto", border: `1px solid ${C.brd}`, borderRadius: 6 }}>
         <table style={{ width: "100%", borderCollapse: "collapse" }}>
-          <thead><tr>{[...hdrs, "Inject", "Withdraw", "Loss%"].map((h, i) => <th key={i} style={{ ...lbl, fontSize: 10, fontWeight: 700, color: C.t2, padding: "5px 4px", background: C.base, borderBottom: `1px solid ${C.brd}`, textAlign: i > 3 && i < 9 ? "right" : "left", whiteSpace: "nowrap" }}>{h}</th>)}</tr></thead>
-          <tbody>{banking.length === 0 ? <tr><td colSpan={12} style={{ ...ui, fontSize: 12, color: C.t3, padding: 8, textAlign: "center" }}>None</td></tr> : banking.map(s => (
+          <thead><tr>{[...hdrs, "Inject", "Withdraw", "Loss%"].map((h, i) => <th key={i} style={{ ...lbl, fontSize: 10, fontWeight: 700, color: C.t2, padding: "5px 4px", background: C.base, borderBottom: `1px solid ${C.brd}`, textAlign: i > 3 && i < 10 ? "right" : "left", whiteSpace: "nowrap" }}>{h}</th>)}</tr></thead>
+          <tbody>{banking.length === 0 ? <tr><td colSpan={13} style={{ ...ui, fontSize: 12, color: C.t3, padding: 8, textAlign: "center" }}>None</td></tr> : banking.map(s => (
             <tr key={s.id}>
               <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}12` }}><button onClick={() => del(s.id)} style={{ background: "none", border: "none", color: C.neg, cursor: "pointer", fontSize: 11 }}>x</button></td>
               <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}12` }}><EditCell value={s.name} onChange={v => update(s.id, "name", v)} type="text" width={80} /></td>
@@ -3289,6 +4366,7 @@ function STOAEditor({ stoa, setStoa, moNames, months }) {
               <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}12`, textAlign: "right" }}><EditCell value={s.mw} onChange={v => update(s.id, "mw", v)} type="number" min={0} width={40} /></td>
               <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}12`, textAlign: "right" }}><EditCell value={s.rate} onChange={v => update(s.id, "rate", v)} type="number" min={0} width={35} /></td>
               <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}12` }}><select value={s.hrs} onChange={e => update(s.id, "hrs", e.target.value)} style={{ ...ui, fontSize: 10, background: C.overlay, color: C.t1, border: `1px solid ${C.brd}`, borderRadius: 3, padding: "2px 3px", cursor: "pointer" }}><option value="RTC">RTC</option><option value="PEAK">PEAK</option><option value="OFF-PEAK">OFF-PK</option></select></td>
+              <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}12` }}><select value={s.corridor || "GNA"} onChange={e => update(s.id, "corridor", e.target.value)} style={{ ...ui, fontSize: 9, background: C.overlay, color: (s.corridor || "GNA") === "GNA" ? C.pos : C.warn, border: `1px solid ${C.brd}`, borderRadius: 3, padding: "2px 2px", cursor: "pointer", minWidth: 42, fontWeight: 600 }}><option value="GNA">GNA</option><option value="TGNA">T-GNA</option></select></td>
               <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}12` }}>{moChips(s, "months")}</td>
               <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}12` }}><select value={s.status} onChange={e => update(s.id, "status", e.target.value)} style={{ ...ui, fontSize: 10, background: C.overlay, color: s.status === "ACTIVE" ? C.pos : C.warn, border: `1px solid ${C.brd}`, borderRadius: 3, padding: "2px 3px", cursor: "pointer" }}><option value="ACTIVE">ACTIVE</option><option value="DRAFT">DRAFT</option></select></td>
               <td style={{ padding: "3px 4px", borderBottom: `1px solid ${C.brd}12` }}>{moChips(s, "injectMo")}</td>
@@ -3311,6 +4389,7 @@ export default function App() {
   const [demandMU, setDemandMU] = useState(DEF_DEMAND_MU); // monthly energy — derived from block data when loaded, calibration target otherwise
   const [mkt, setMkt] = useState(DEF_MKT);
   const [uploaded96, setUploaded96] = useState(REF96); // { demand: {calMo: [96]}, dam/rtm/gdam: {calMo: [96]} } — preloaded with the built-in reference dataset; uploads replace it
+  const [uploaded96Daily, setUploaded96Daily] = useState({}); // { demand: {"YYYY-MM-DD": [96]}, ... } — daily block data upload
   const [stoa, setStoa] = useState(DEF_STOA);
   const [fdre, setFdre] = useState(DEF_FDRE);
   const [rpo, setRpo] = useState(DEF_RPO);
@@ -3323,18 +4402,46 @@ export default function App() {
   const [bankSc, setBankSc] = useState("base"); // Banking page scenario selector
   const [sideOpen, setSideOpen] = useState(true);
   const [startMo, setStartMo] = useState(DEF_START);
+  const [computedAt, setComputedAt] = useState(() => new Date().toLocaleTimeString());
+  const [runId, setRunId] = useState(1); // increments on RUN DISPATCH
+  const [dirty, setDirty] = useState(false); // true when inputs changed since last run
+  const [showInfo, setShowInfo] = useState(false); // info modal open for current tab
 
+  // Track input changes → mark dirty
+  const inputSig = useMemo(() => JSON.stringify([
+    plants.map(p => [p.id, p.pMax, p.pMin, p.ecr, p.avail, p.mustRun, p.corridor].join(",")),
+    demand, demandMU, stoa.map(s => [s.id, s.mw, s.rate, s.status, s.dir, s.corridor].join(",")),
+    [mkt.damLim, mkt.gdamLim, mkt.rtmLim, mkt.rtmPrem, mkt.gnaQuantum, mkt.tgnaRate],
+    mkt.damMCP, mkt.gdamMCP, mkt.bilatRate,
+    fdre.map(f => [f.id, f.mw, f.status].join(",")), startMo,
+    uploaded96 ? Object.keys(uploaded96).length + ":" + Object.values(uploaded96).map(v => Object.keys(v).length).join(",") : "0",
+    scenarios.filter(s => s.active).map(s => [s.id, s.demMult, s.reMult, s.priceMult, s.fuelMult].join(","))
+  ]), [plants, demand, demandMU, stoa, mkt, fdre, startMo, uploaded96, scenarios]);
+  const lastSigRef = useRef(inputSig);
+  useEffect(() => {
+    if (inputSig !== lastSigRef.current) { setDirty(true); lastSigRef.current = inputSig; }
+  }, [inputSig]);
+
+  const runDispatch = useCallback(() => {
+    setRunId(prev => prev + 1);
+    setDirty(false);
+    setComputedAt(new Date().toLocaleTimeString());
+  }, []);
+
+  // Auto-run on first mount (runId starts at 1)
   const months = useMemo(() => buildMonths(startMo), [startMo]);
   const moNames = useMemo(() => months.map(m => m.name), [months]);
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const all = useMemo(() => {
     return months.map((m, i) => {
       const b96 = dispatch96(plants, demand[m.cal], m.cal, stoa, mkt, fdre, {}, m.cal, m.days, uploaded96, demandMU[m.cal] || 0);
       const agg = aggMonthly(b96, m.days);
       return { mo: m.name, mi: i, cal: m.cal, days: m.days, pk: demand[m.cal], b96, agg, stoaMW: Math.round(safeMean(b96, "stoaBuy")) };
     });
-  }, [plants, demand, demandMU, stoa, mkt, fdre, months, uploaded96]);
+  }, [runId]); // only recomputes on explicit RUN
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const scenarioResults = useMemo(() => {
     return scenarios.filter(s => s.active).map(sc => {
       let demMU = 0, costCr = 0, mktMU = 0, curtailMU = 0, genMU = 0, surMU = 0, unsMU = 0, pkMax = 0;
@@ -3348,9 +4455,14 @@ export default function App() {
       });
       return { ...sc, demMU: Math.round(demMU), costCr: +costCr.toFixed(1), mktMU: Math.round(mktMU), curtailMU: +curtailMU.toFixed(1), genMU: Math.round(genMU), surMU: Math.round(surMU), unsMU: +unsMU.toFixed(1), pkMax: Math.round(pkMax), avgCost: demMU > 0 ? +(costCr * 100 / (demMU * 10)).toFixed(2) : 0 };
     });
-  }, [plants, demand, demandMU, stoa, mkt, fdre, scenarios, months, uploaded96]);
+  }, [runId]); // only recomputes on explicit RUN
 
   const rpoData = useMemo(() => computeRPO(all, plants, stoa, fdre, rpo, mkt), [all, plants, stoa, fdre, rpo, mkt]);
+
+  const gnaByMo = useMemo(() => {
+    if (!mkt.gnaQuantum || mkt.gnaQuantum <= 0) return null;
+    return all.map(r => annotateGNA(r.b96, plants, stoa, mkt, r.cal));
+  }, [all, plants, stoa, mkt]);
 
   const R = all[mo];
   const gRes = (res === "15min" || res === "hourly") ? res : "hourly";
@@ -3371,47 +4483,62 @@ export default function App() {
     avgCost: (() => { const tC = safeSum(all, r => r.agg.costCr); const tE = safeSum(all, r => r.agg.demMU); return tE > 0 ? +(tC * 100 / (tE * 10)).toFixed(2) : 0; })(),
   }), [all, plants]);
 
-  // ── Daily resolution: detect if selected month is current calendar month ──
+  // ── Daily resolution ──
   const today = new Date();
   const currentCalMo = today.getMonth(); // 0=Jan
+  const nextCalMo = (currentCalMo + 1) % 12;
   const isCurrentMonth = months[mo].cal === currentCalMo;
+  const isNextMonth = months[mo].cal === nextCalMo;
+  const isDailyEligible = isCurrentMonth || isNextMonth; // 1D available for current + next month
   const isDaily = res === "daily";
+  const [selDay, setSelDay] = useState(null); // selected day index for block drill-down
 
-  const dailyData = useMemo(() => {
-    if (!isDaily || !R) return [];
-    const calMo = months[mo].cal;
+  // ── Daily chronological dispatch: run dispatch96 for each day of current + next month ──
+  const dailyChron = useMemo(() => {
+    if (!isDaily) return [];
     const yr = today.getFullYear();
-    const daysInMo = months[mo].days;
-    const todayDate = isCurrentMonth ? today.getDate() : 0; // show all days if not current month
-    const startDay = todayDate + 1; // tomorrow
-    if (startDay > daysInMo) return []; // month already over
-
     const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const calMo = months[mo].cal;
+    const daysInMo = months[mo].days;
+    // For current month: start from tomorrow; for next month: all days
+    const startDay = isCurrentMonth ? Math.min(today.getDate() + 1, daysInMo) : 1;
+    if (startDay > daysInMo) return [];
+
     const results = [];
     for (let d = startDay; d <= daysInMo; d++) {
-      const dt = new Date(yr, calMo, d);
+      const moIdx = calMo;
+      const yearForDate = (calMo === 0 && currentCalMo === 11) ? yr + 1 : yr; // handle Dec→Jan wrap
+      const dt = new Date(yearForDate, moIdx, d);
       const dow = DOW[dt.getDay()];
-      const isWeekend = dt.getDay() === 0 || dt.getDay() === 6;
-      // Weekend demand ~88%, Friday slightly lower ~96%
-      const dayFactor = isWeekend ? 0.88 : (dt.getDay() === 5 ? 0.96 : 1.0);
-      // Slight daily noise based on day number
-      const noise = Math.sin(d * 2.71) * 0.02;
-      const adjPeak = Math.round(demand[calMo] * (dayFactor + noise));
+      const dateStr = `${yearForDate}-${String(moIdx + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
 
-      // basePeak = monthly peak so the MU-calibrated LF is preserved and scaled to the day's adjPeak
-      const b96 = dispatch96(plants, adjPeak, calMo, stoa, mkt, fdre, {}, calMo, 1, uploaded96, demandMU[calMo] || 0, demand[calMo]);
-      const agg = aggMonthly(b96, 1); // 1-day aggregation
+      // Build per-day block data (daily upload > scaled monthly fallback)
+      const dayBlocks = buildDailyBlockData(uploaded96Daily, uploaded96, moIdx, dateStr, d, dt.getDay());
+
+      // Daily peak: from daily demand blocks, or scaled from monthly peak
+      let adjPeak;
+      const dayDemBlocks = dayBlocks.demand?.[moIdx];
+      if (dayDemBlocks) {
+        adjPeak = Math.round(Math.max(...dayDemBlocks));
+      } else {
+        const f = dailyScaleFactor(d, dt.getDay(), moIdx);
+        adjPeak = Math.round(demand[moIdx] * f);
+      }
+
+      const b96 = dispatch96(plants, adjPeak, moIdx, stoa, mkt, fdre, {}, moIdx, 1, dayBlocks, demandMU[moIdx] || 0, demand[moIdx]);
+      const agg = aggMonthly(b96, 1);
       results.push({
-        day: d,
-        lbl: `${d} ${CAL_MO[calMo]}`,
-        dow,
-        isWeekend,
-        pk: adjPeak,
-        b96, agg,
+        day: d, dateStr, calMo: moIdx,
+        lbl: `${d} ${CAL_MO[moIdx]}`,
+        dow, isWeekend: dt.getDay() === 0 || dt.getDay() === 6,
+        pk: adjPeak, b96, agg,
       });
     }
     return results;
-  }, [isDaily, R, mo, months, demand, demandMU, plants, stoa, mkt, fdre, uploaded96]);
+  }, [isDaily, mo, months, demand, demandMU, plants, stoa, mkt, fdre, uploaded96, uploaded96Daily]);
+
+  // Backward compat: dailyData alias for DailyView
+  const dailyData = dailyChron;
 
   // ── Balance page scenario filter: recompute the full year under the selected scenario ──
   const balScenario = useMemo(() => scenarios.find(s => s.id === balSc) || scenarios[0], [scenarios, balSc]);
@@ -3424,7 +4551,8 @@ export default function App() {
       const agg = aggMonthly(b96, m.days);
       return { mo: m.name, mi: i, cal: m.cal, days: m.days, pk: Math.round(safeMax(b96, "dem")), b96, agg };
     });
-  }, [all, balScenario, plants, demand, demandMU, stoa, mkt, fdre, months, uploaded96]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [all, balScenario, runId]); // gated by runId via `all`; scenario selection is reactive
   const RB = allBal[mo];
 
   // Banking page: its own scenario selection (reuses base/Balance results when they coincide)
@@ -3437,7 +4565,8 @@ export default function App() {
       const agg = aggMonthly(b96, m.days);
       return { mo: m.name, mi: i, cal: m.cal, days: m.days, pk: Math.round(safeMax(b96, "dem")), b96, agg };
     });
-  }, [all, allBal, balSc, bankScenario, plants, demand, demandMU, stoa, mkt, fdre, months, uploaded96]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [all, allBal, balSc, bankScenario, runId]); // gated by runId via `all`
 
   // ── Results export: multi-sheet XLSX for the selected Balance scenario ──
   const exportXLSX = useCallback(() => {
@@ -3508,14 +4637,15 @@ export default function App() {
   const sideW = sideOpen ? 170 : 46;
   const yearLabel = useMemo(() => {
     const s = CAL_MO[startMo]; const e = CAL_MO[(startMo + 11) % 12];
-    const now = new Date(); const sy = startMo <= now.getMonth() ? now.getFullYear() : now.getFullYear();
-    return `${s} ${sy} — ${e} ${startMo > 0 ? sy + 1 : sy}`;
+    const now = new Date(); const sy = startMo <= now.getMonth() ? now.getFullYear() : now.getFullYear() - 1;
+    const ey = sy + (startMo > 0 ? 1 : 0);
+    return `${s} ${sy} — ${e} ${ey}`;
   }, [startMo]);
 
   return (
-    <div style={{ background: C.base, color: C.t1, height: "100vh", ...ui, fontSize: 13, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+    <div style={{ background: C.base, color: C.t1, height: "100vh", ...ui, fontSize: 13, display: "flex", flexDirection: "column", overflow: "hidden", colorScheme: "dark" }}>
       {/* ─── HEADER BAR ─── */}
-      <div style={{ background: C.elev, borderBottom: `1px solid ${C.brd}`, padding: "0 12px", display: "flex", alignItems: "center", minHeight: 36, flexShrink: 0, zIndex: 50, gap: 10 }}>
+      <div style={{ background: C.elev, borderBottom: `1px solid ${C.brd}`, padding: "2px 12px", display: "flex", alignItems: "center", minHeight: 36, flexShrink: 0, zIndex: 50, gap: 10, flexWrap: "wrap" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }} onClick={() => setSideOpen(!sideOpen)}>
           <div style={{ width: 22, height: 22, borderRadius: 3, background: `linear-gradient(135deg, ${C.focus}, ${C.focus}66)`, display: "flex", alignItems: "center", justifyContent: "center" }}>
             <span style={{ fontSize: 10, fontWeight: 900, color: "#fff" }}>P</span>
@@ -3533,7 +4663,7 @@ export default function App() {
         {/* Month selector inline */}
         <div style={{ display: "flex", gap: 1, alignItems: "center", flexWrap: "wrap" }}>
           {moNames.map((m, i) => (
-            <button key={i} onClick={() => { setMo(i); if (res === "daily" && months[i].cal !== currentCalMo) setRes("15min"); }} style={{
+            <button key={i} onClick={() => { setMo(i); setSelDay(null); if (res === "daily" && months[i].cal !== currentCalMo && months[i].cal !== nextCalMo) setRes("15min"); }} style={{
               ...mono, fontSize: 10, padding: "2px 6px", borderRadius: 2, cursor: "pointer",
               border: mo === i ? `1px solid ${C.focus}` : `1px solid ${C.brd}88`,
               background: mo === i ? C.focus + "22" : C.elev,
@@ -3546,11 +4676,18 @@ export default function App() {
           <div style={{ width: 1, height: 14, background: C.brd }} />
           <div style={{ display: "flex", gap: 1, background: C.base, borderRadius: 2, padding: 1, border: `1px solid ${C.brd}` }}>
             {[["daily", "1D"], ["15min", "15M"], ["hourly", "1H"], ["fortnightly", "FN"], ["monthly", "MO"]].map(([id, l]) =>
-              <ResBtn key={id} active={res === id} onClick={() => setRes(id)} disabled={id === "daily" && !isCurrentMonth}>{l}</ResBtn>
+              <ResBtn key={id} active={res === id} onClick={() => { setRes(id); if (id === "daily") setSelDay(null); }} disabled={id === "daily" && !isDailyEligible}>{l}</ResBtn>
             )}
           </div>
           <button onClick={exportCSV} style={{ ...lbl, fontSize: 10, padding: "2px 7px", borderRadius: 2, border: `1px solid ${C.brd}88`, cursor: "pointer", background: C.elev, color: C.t1 }}>CSV</button>
-          <span style={{ ...mono, fontSize: 10, padding: "2px 6px", borderRadius: 2, background: C.focus + "15", color: C.focus, border: `1px solid ${C.focus}33` }}>PLAN</span>
+          <div style={{ width: 1, height: 14, background: C.brd }} />
+          <button onClick={runDispatch} style={{
+            ...lbl, fontSize: 11, padding: "4px 14px", borderRadius: 3, cursor: "pointer", fontWeight: 700, letterSpacing: 1, transition: "all 0.15s",
+            background: dirty ? C.focus : C.pos + "22",
+            color: dirty ? "#fff" : C.pos,
+            border: dirty ? `1px solid ${C.focus}` : `1px solid ${C.pos}44`,
+            boxShadow: dirty ? `0 0 8px ${C.focus}44` : "none",
+          }}>{dirty ? "▶ RUN DISPATCH" : "✓ DISPATCHED"}</button>
         </div>
       </div>
 
@@ -3559,16 +4696,28 @@ export default function App() {
         {/* SIDEBAR */}
         <div style={{ width: sideW, flexShrink: 0, background: C.elev, borderRight: `1px solid ${C.brd}`, display: "flex", flexDirection: "column", transition: "width 0.15s ease", overflow: "hidden" }}>
           <div style={{ flex: 1, paddingTop: 6 }}>
-            {NAV.map(n => {
+            {NAV.map((n, ni) => {
               const active = tab === n.id;
+              const zc = NAV_ZONE_CLR[n.zone] || C.focus;
+              // Insert zone dividers before first item of each zone
+              const prevZone = ni > 0 ? NAV[ni - 1].zone : null;
+              const showDivider = n.zone !== prevZone;
               return (
-                <div key={n.id} onClick={() => setTab(n.id)} style={{
-                  display: "flex", alignItems: "center", gap: 8, height: 34, padding: "0 12px", cursor: "pointer",
-                  background: active ? C.focus + "12" : "transparent",
-                  borderLeft: active ? `3px solid ${C.focus}` : "3px solid transparent",
-                }} title={n.label}>
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill={active ? C.focus : C.t2} style={{ flexShrink: 0 }}><path d={n.icon} /></svg>
-                  {sideOpen && <span style={{ ...lbl, fontSize: 11, color: active ? C.focus : C.t2, fontWeight: active ? 700 : 500, whiteSpace: "nowrap", overflow: "hidden" }}>{n.label}</span>}
+                <div key={n.id}>
+                  {showDivider && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 4, padding: sideOpen ? "6px 12px 2px" : "6px 8px 2px", marginTop: ni > 0 ? 4 : 0 }}>
+                      <div style={{ width: 6, height: 6, borderRadius: "50%", background: zc, opacity: 0.6 }} />
+                      {sideOpen && <span style={{ ...lbl, fontSize: 9, color: zc, fontWeight: 700, letterSpacing: 1, textTransform: "uppercase", opacity: 0.7 }}>{n.zone}</span>}
+                    </div>
+                  )}
+                  <div onClick={() => setTab(n.id)} style={{
+                    display: "flex", alignItems: "center", gap: 8, height: 34, padding: "0 12px", cursor: "pointer",
+                    background: active ? zc + "15" : "transparent",
+                    borderLeft: active ? `3px solid ${zc}` : "3px solid transparent",
+                  }} title={n.label}>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill={active ? zc : C.t2} style={{ flexShrink: 0 }}><path d={n.icon} /></svg>
+                    {sideOpen && <span style={{ ...lbl, fontSize: 11, color: active ? zc : C.t2, fontWeight: active ? 700 : 500, whiteSpace: "nowrap", overflow: "hidden" }}>{n.label}</span>}
+                  </div>
                 </div>
               );
             })}
@@ -3581,6 +4730,7 @@ export default function App() {
                 <div>PEAK <span style={{ color: C.warn }}>{R.pk}MW</span></div>
                 <div>COST <span style={{ color: C.neg }}>Rs{annual.costCr}Cr</span></div>
                 <div>RPO <span style={{ color: rpoData.recCost?.total > 0 ? C.warn : C.pos }}>{(rpoData.totMU > 0 ? rpoData.fulfilled?.total / rpoData.totMU * 100 : 0).toFixed(1)}%</span></div>
+                {mkt.gnaQuantum > 0 && <div>GNA <span style={{ color: C.pos }}>{mkt.gnaQuantum}MW</span>{mkt.tgnaRate > 0 && <span style={{ color: C.warn }}> T₹{mkt.tgnaRate}</span>}</div>}
               </div>
             </div>
           )}
@@ -3588,17 +4738,45 @@ export default function App() {
 
         {/* MAIN CONTENT */}
         <div style={{ flex: 1, overflow: "auto", padding: 10, paddingBottom: 32 }}>
+          {/* Info button — top-right of every tab */}
+          <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 4 }}>
+            <InfoButton tabId={tab} onOpen={() => setShowInfo(true)} />
+          </div>
+          {showInfo && <InfoModal tabId={tab} onClose={() => setShowInfo(false)} />}
 
           {tab === "config" && (
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              <Panel title="96-BLOCK DATA UPLOAD" accent={C.focus}><DataUploader demand={demand} setDemand={setDemand} mkt={mkt} setMkt={setMkt} months={months} moNames={moNames} uploaded96={uploaded96} setUploaded96={setUploaded96} demandMU={demandMU} setDemandMU={setDemandMU} /></Panel>
+              {/* ── Sticky sub-nav ── */}
+              <div style={{ position: "sticky", top: 0, zIndex: 20, background: C.base, borderBottom: `1px solid ${C.brd}`, padding: "6px 0 5px", display: "flex", gap: 2, flexWrap: "wrap" }}>
+                {[
+                  { id: "cfg-data", label: "Data", accent: C.focus },
+                  { id: "cfg-supply", label: "Supply", accent: C.thermal },
+                  { id: "cfg-demand", label: "Demand & Market", accent: C.warn },
+                  { id: "cfg-contracts", label: "Contracts", accent: C.bilat },
+                  { id: "cfg-policy", label: "Policy & Scenarios", accent: C.dec },
+                ].map(s => (
+                  <button key={s.id} onClick={() => document.getElementById(s.id)?.scrollIntoView({ behavior: "smooth", block: "start" })}
+                    style={{ ...lbl, fontSize: 10, padding: "3px 10px", borderRadius: 2, border: `1px solid ${s.accent}44`, cursor: "pointer", background: s.accent + "12", color: s.accent, fontWeight: 600 }}>{s.label}</button>
+                ))}
+              </div>
+              {/* ── DATA ── */}
+              <div id="cfg-data" style={{ ...lbl, fontSize: 11, fontWeight: 700, color: C.focus, padding: "8px 0 2px", borderBottom: `2px solid ${C.focus}33`, letterSpacing: 1 }}>DATA IMPORT</div>
+              <Panel title="96-BLOCK DATA UPLOAD (MONTHLY + DAILY)" accent={C.focus}><DataUploader demand={demand} setDemand={setDemand} mkt={mkt} setMkt={setMkt} months={months} moNames={moNames} uploaded96={uploaded96} setUploaded96={setUploaded96} demandMU={demandMU} setDemandMU={setDemandMU} uploaded96Daily={uploaded96Daily} setUploaded96Daily={setUploaded96Daily} /></Panel>
+              {/* ── SUPPLY ── */}
+              <div id="cfg-supply" style={{ ...lbl, fontSize: 11, fontWeight: 700, color: C.thermal, padding: "8px 0 2px", borderBottom: `2px solid ${C.thermal}33`, letterSpacing: 1 }}>SUPPLY PORTFOLIO</div>
               <Panel title="GENERATION PORTFOLIO" accent={C.thermal}><PlantEditor plants={plants} setPlants={setPlants} /></Panel>
               <Panel title="STORAGE ASSETS — BESS / PSP / PONDAGE HYDRO" accent={SEG_CLR.BESS}><StorageEditor plants={plants} setPlants={setPlants} /></Panel>
               <Panel title="OUTAGE / AVAILABILITY CALENDAR" accent={C.neg}><OutageEditor plants={plants} setPlants={setPlants} moNames={moNames} months={months} /></Panel>
+              {/* ── DEMAND & MARKET ── */}
+              <div id="cfg-demand" style={{ ...lbl, fontSize: 11, fontWeight: 700, color: C.warn, padding: "8px 0 2px", borderBottom: `2px solid ${C.warn}33`, letterSpacing: 1 }}>DEMAND & MARKET</div>
               <Panel title="MONTHLY PEAK DEMAND & ENERGY" accent={C.warn}><DemandEditor demand={demand} setDemand={setDemand} demandMU={demandMU} setDemandMU={setDemandMU} moNames={moNames} months={months} uploaded96={uploaded96} /></Panel>
               <Panel title="MARKET PRICES & LIMITS" accent={C.dam}><MarketEditor mkt={mkt} setMkt={setMkt} moNames={moNames} months={months} uploaded96={uploaded96} /></Panel>
+              {/* ── CONTRACTS ── */}
+              <div id="cfg-contracts" style={{ ...lbl, fontSize: 11, fontWeight: 700, color: C.bilat, padding: "8px 0 2px", borderBottom: `2px solid ${C.bilat}33`, letterSpacing: 1 }}>CONTRACTS</div>
               <Panel title="STOA CONTRACTS" accent={C.bilat}><STOAEditor stoa={stoa} setStoa={setStoa} moNames={moNames} months={months} /></Panel>
               <Panel title="FDRE CONTRACTS" accent={C.psp}><FDREEditor fdre={fdre} setFdre={setFdre} moNames={moNames} months={months} /></Panel>
+              {/* ── POLICY & SCENARIOS ── */}
+              <div id="cfg-policy" style={{ ...lbl, fontSize: 11, fontWeight: 700, color: C.dec, padding: "8px 0 2px", borderBottom: `2px solid ${C.dec}33`, letterSpacing: 1 }}>POLICY & SCENARIOS</div>
               <Panel title="RPO TARGETS" accent={C.pos}><RPOEditor rpo={rpo} setRpo={setRpo} /></Panel>
               <Panel title="STOCHASTIC SCENARIOS" accent={C.dec}><ScenarioEditor scenarios={scenarios} setScenarios={setScenarios} uploaded96={uploaded96} /></Panel>
             </div>
@@ -3616,6 +4794,7 @@ export default function App() {
                 <KPI label="Fixed Cost" value={annual.fixedCostCr} unit="Cr" color={C.warn} accent={C.warn} />
                 <KPI label="Total Cost" value={annual.costCr} unit="Cr" color={C.neg} accent={C.neg} />
                 <KPI label="RPO" value={(rpoData.totMU > 0 ? rpoData.fulfilled?.total / rpoData.totMU * 100 : 0).toFixed(1)} unit="%" color={rpoData.recCost?.total > 0 ? C.warn : C.pos} accent={rpoData.recCost?.total > 0 ? C.warn : C.pos} />
+                {gnaByMo && <KPI label="T-GNA Cost" value={(safeSum(gnaByMo.flat().filter(Boolean), g => g.tgnaCostLk) / 100).toFixed(2)} unit="Cr" color={C.warn} accent={C.warn} sub={`GNA ${mkt.gnaQuantum} MW`} />}
               </div>
               {isDaily ? (
                 <Panel title={`${R.mo} DAILY DISPATCH (D+1 → ${months[mo].days})`} accent={C.focus}><DailyView dailyData={dailyData} moName={R.mo} /></Panel>
@@ -3645,7 +4824,30 @@ export default function App() {
 
           {tab === "dispatch" && (
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              {isDaily ? <Panel title={`${R.mo} DAILY DISPATCH`} accent={C.focus}><DailyView dailyData={dailyData} moName={R.mo} /></Panel> : isAgg ? <Panel title="ENERGY BALANCE" accent={C.pos}><AggView all={all} res={res} /></Panel> : (
+              <div style={{ display: "flex", alignItems: "center", gap: 6, justifyContent: "flex-end" }}>
+                <button onClick={exportCSV} style={{ ...lbl, fontSize: 10, padding: "3px 10px", borderRadius: 2, border: `1px solid ${C.brd}88`, cursor: "pointer", background: C.elev, color: C.t1 }}>CSV {R.mo}</button>
+                <button onClick={exportXLSX} style={{ ...lbl, fontSize: 10, padding: "3px 10px", borderRadius: 2, border: `1px solid ${C.pos}44`, cursor: "pointer", background: C.pos + "12", color: C.pos, fontWeight: 600 }}>XLSX Full</button>
+              </div>
+              {isDaily ? (
+                <>
+                  <Panel title={`${R.mo} DAILY PLANNING — BLOCK-WISE & DAY-WISE`} accent={C.focus}>
+                    <DailyPlanView dailyChron={dailyChron} moName={R.mo} selDay={selDay} setSelDay={setSelDay} plants={plants} res={res} />
+                  </Panel>
+                  {/* 96-block drill-down for the selected day */}
+                  {selDay != null && dailyChron[selDay] && (
+                    <>
+                      <div style={{ ...lbl, fontSize: 11, color: C.focus, padding: "4px 0", borderBottom: `2px solid ${C.focus}33` }}>
+                        96-BLOCK DETAIL — {dailyChron[selDay].lbl} ({dailyChron[selDay].dow}) — Peak {dailyChron[selDay].pk} MW
+                      </div>
+                      <Panel title={`${dailyChron[selDay].lbl} GENERATION STACK`} accent={C.thermal}><StackChart data={dailyChron[selDay].b96} plants={plants} res={gRes} /></Panel>
+                      <Panel title="SURPLUS — DEFICIT (MW)" accent={C.info}><SurplusDeficitChart data={dailyChron[selDay].b96} res={gRes} /></Panel>
+                      <Panel title="STORAGE CHARGE / DISCHARGE CYCLES" accent={C.bess}><StorageCyclesChart data={dailyChron[selDay].b96} plants={plants} res={gRes} /></Panel>
+                      <Panel title="PRICE CURVES" accent={C.dam}><PriceChart data={dailyChron[selDay].b96} res={gRes} /></Panel>
+                      <Panel title="MERIT ORDER TABLE" accent={C.val}><MeritTable data={dailyChron[selDay].b96} plants={plants} days={1} /></Panel>
+                    </>
+                  )}
+                </>
+              ) : isAgg ? <Panel title="ENERGY BALANCE" accent={C.pos}><AggView all={all} res={res} /></Panel> : (
                 <>
                   <Panel title={`${R.mo} GENERATION STACK`} accent={C.thermal}><StackChart data={R.b96} plants={plants} res={gRes} /></Panel>
                   <Panel title="SURPLUS — DEFICIT (MW)" accent={C.info}><SurplusDeficitChart data={R.b96} res={gRes} /></Panel>
@@ -3657,23 +4859,63 @@ export default function App() {
                   </div>
                 </>
               )}
-              <Panel title="MERIT ORDER TABLE" accent={C.val}><MeritTable data={R.b96} plants={plants} days={R.days} /></Panel>
+              {!isDaily && <Panel title="MERIT ORDER TABLE" accent={C.val}><MeritTable data={R.b96} plants={plants} days={R.days} /></Panel>}
             </div>
           )}
 
           {tab === "market" && (
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, justifyContent: "flex-end" }}>
+                <button onClick={() => {
+                  const hdr = ["Block", "Time", "DAM_MW", "GDAM_MW", "RTM_MW", "DAM_Rate", "GDAM_Rate", "RTM_Rate", "Surplus_MW", "Sell_MW"];
+                  const rows = [hdr, ...R.b96.map(b => [b.t, b.lbl, b.mktDAM || 0, b.mktGDAM || 0, b.mktRTM || 0, b.damRate || 0, b.gdamRate || 0, b.rtmRate || 0, b.sur || 0, b.mktSell || 0])];
+                  const csv = rows.map(r => r.join(",")).join("\n");
+                  const blob = new Blob([csv], { type: "text/csv" });
+                  const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = `POPT_Market_${R.mo}.csv`; a.click(); URL.revokeObjectURL(url);
+                }} style={{ ...lbl, fontSize: 10, padding: "3px 10px", borderRadius: 2, border: `1px solid ${C.brd}88`, cursor: "pointer", background: C.elev, color: C.t1 }}>CSV {R.mo}</button>
+              </div>
+              {/* ── KPI row: per-segment prices + volume summary ── */}
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))", gap: 6 }}>
-                <KPI label="DAM" value={(mkt.damMCP[months[mo].cal] || 0).toFixed(2)} unit="Rs/kWh" color={C.dam} accent={C.dam} />
-                <KPI label="GDAM" value={(mkt.gdamMCP[months[mo].cal] || 0).toFixed(2)} unit="Rs/kWh" color={C.gdam} accent={C.gdam} />
-                <KPI label="RTM" value={((mkt.damMCP[months[mo].cal] || 0) * (1 + mkt.rtmPrem / 100)).toFixed(2)} unit="Rs/kWh" color={C.rtm} accent={C.rtm} />
+                <KPI label="DAM MCP" value={(mkt.damMCP[months[mo].cal] || 0).toFixed(2)} unit="Rs/kWh" color={C.dam} accent={C.dam} sub={`Lim ${mkt.damLim} MW`} />
+                <KPI label="GDAM MCP" value={(mkt.gdamMCP[months[mo].cal] || 0).toFixed(2)} unit="Rs/kWh" color={C.gdam} accent={C.gdam} sub={`Lim ${mkt.gdamLim} MW`} />
+                <KPI label="RTM" value={((mkt.damMCP[months[mo].cal] || 0) * (1 + mkt.rtmPrem / 100)).toFixed(2)} unit="Rs/kWh" color={C.rtm} accent={C.rtm} sub={`Lim ${mkt.rtmLim} MW | +${mkt.rtmPrem}%`} />
                 <KPI label="Bilateral" value={(mkt.bilatRate[months[mo].cal] || 0).toFixed(2)} unit="Rs/kWh" color={C.bilat} accent={C.bilat} />
+                <KPI label="PX Buy" value={R.agg.mktMU} unit="MU" color={C.dam} accent={C.dam} sub={`DAM ${R.agg.mktDAM_MU} | GDAM ${R.agg.mktGDAM_MU} | RTM ${R.agg.mktRTM_MU}`} />
+                <KPI label="Surplus Sold" value={R.agg.surMU} unit="MU" color={C.pos} accent={C.pos} />
                 <KPI label={`${R.mo} Cost`} value={R.agg.costCr} unit="Cr" color={C.neg} accent={C.neg} />
                 <KPI label="Avg Cost" value={R.agg.avgCost} unit="Rs/kWh" color={C.thermal} accent={C.thermal} />
-                <KPI label="Deficit" value={R.agg.defMU} unit="MU" color={C.neg} accent={C.neg} />
-                <KPI label="Surplus" value={R.agg.surMU} unit="MU" color={C.pos} accent={C.pos} />
               </div>
-              {isDaily ? <Panel title={`${R.mo} DAILY COST`} accent={C.focus}><DailyView dailyData={dailyData} moName={R.mo} /></Panel> : !isAgg && <Panel title="PRICE CURVES" accent={C.dam}><PriceChart data={R.b96} res={gRes} /></Panel>}
+
+              {/* ── Block-wise market quantum + segment breakup ── */}
+              {isDaily ? (
+                <Panel title={`${R.mo} DAILY COST`} accent={C.focus}><DailyView dailyData={dailyData} moName={R.mo} /></Panel>
+              ) : !isAgg && (
+                <>
+                  <Panel title="PX SPOT MARKET — BLOCK-WISE MW QUANTUM" accent={C.dam}>
+                    <MarketQuantumChart data={R.b96} res={gRes} mkt={mkt} />
+                  </Panel>
+                  <Panel title="SEGMENT VOLUME BREAKUP & WEIGHTED AVG COST" accent={C.dam}>
+                    <MarketBreakup data={R.b96} days={R.days} />
+                  </Panel>
+                  <Panel title="PRICE CURVES" accent={C.dam}><PriceChart data={R.b96} res={gRes} /></Panel>
+                  {gnaByMo && gnaByMo[mo] && (
+                    <Panel title="GNA CORRIDOR UTILIZATION" accent={C.pos}>
+                      <GNACorridorChart gnaData={gnaByMo[mo]} res={gRes} />
+                    </Panel>
+                  )}
+                </>
+              )}
+              {/* Annual GNA summary when in aggregate view */}
+              {isAgg && gnaByMo && (
+                <Panel title="GNA CORRIDOR UTILIZATION — ANNUAL SUMMARY" accent={C.pos}>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 6, marginBottom: 8 }}>
+                    <KPI label="GNA Quantum" value={mkt.gnaQuantum} unit="MW" color={C.pos} accent={C.pos} />
+                    <KPI label="T-GNA Rate" value={mkt.tgnaRate} unit="Rs/kWh" color={C.warn} accent={C.warn} />
+                    <KPI label="Annual T-GNA Cost" value={(safeSum(gnaByMo.flat(), g => g?.tgnaCostLk || 0) / 100).toFixed(2)} unit="Cr" color={C.neg} accent={C.neg} />
+                    <KPI label="Avg GNA Util" value={(() => { const flat = gnaByMo.flat().filter(Boolean); return flat.length ? Math.round(safeMean(flat, g => (g.gnaQ > 0 ? g.totalGNA / g.gnaQ * 100 : 0))) : 0; })()} unit="%" color={C.info} accent={C.info} />
+                  </div>
+                </Panel>
+              )}
               <Panel title="ANNUAL PRICE TRAJECTORY" accent={C.dam}>
                 <ResponsiveContainer width="100%" height={220}>
                   <LineChart data={moNames.map((m, i) => { const ci = months[i].cal; return { mo: m, DAM: mkt.damMCP[ci], GDAM: mkt.gdamMCP[ci], RTM: +(mkt.damMCP[ci] * (1 + mkt.rtmPrem / 100)).toFixed(2), Bilateral: mkt.bilatRate[ci] }; })} margin={{ top: 5, right: 5, bottom: 5, left: 5 }}>
@@ -3687,6 +4929,46 @@ export default function App() {
                     <Line type="monotone" dataKey="Bilateral" stroke={C.bilat} strokeWidth={2} strokeDasharray="5 5" dot={{ r: 3 }} />
                   </LineChart>
                 </ResponsiveContainer>
+              </Panel>
+              {/* ── Annual market summary table ── */}
+              <Panel title="ANNUAL PX MARKET SUMMARY" accent={C.dam}>
+                <div style={{ overflowX: "auto" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                    <thead>
+                      <tr>
+                        <th style={{ ...lbl, fontSize: 10, padding: "4px 6px", textAlign: "left", borderBottom: `1px solid ${C.brd}`, color: C.t3 }}>MONTH</th>
+                        <th style={{ ...lbl, fontSize: 10, padding: "4px 6px", textAlign: "right", borderBottom: `1px solid ${C.brd}`, color: C.dam }}>DAM MU</th>
+                        <th style={{ ...lbl, fontSize: 10, padding: "4px 6px", textAlign: "right", borderBottom: `1px solid ${C.brd}`, color: C.gdam }}>GDAM MU</th>
+                        <th style={{ ...lbl, fontSize: 10, padding: "4px 6px", textAlign: "right", borderBottom: `1px solid ${C.brd}`, color: C.rtm }}>RTM MU</th>
+                        <th style={{ ...lbl, fontSize: 10, padding: "4px 6px", textAlign: "right", borderBottom: `1px solid ${C.brd}`, color: C.t2 }}>TOTAL BUY</th>
+                        <th style={{ ...lbl, fontSize: 10, padding: "4px 6px", textAlign: "right", borderBottom: `1px solid ${C.brd}`, color: C.pos }}>SURPLUS MU</th>
+                        <th style={{ ...lbl, fontSize: 10, padding: "4px 6px", textAlign: "right", borderBottom: `1px solid ${C.brd}`, color: C.t2 }}>NET PX MU</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {all.map((r, i) => (
+                        <tr key={i} style={{ background: i === mo ? C.focus + "11" : "transparent", cursor: "pointer" }} onClick={() => typeof setMo === "function" && setMo(i)}>
+                          <td style={{ ...mono, fontSize: 11, padding: "4px 6px", borderBottom: `1px solid ${C.brd}22`, fontWeight: i === mo ? 700 : 400 }}>{r.mo}</td>
+                          <td style={{ ...mono, fontSize: 11, padding: "4px 6px", textAlign: "right", borderBottom: `1px solid ${C.brd}22`, color: C.dam }}>{r.agg.mktDAM_MU}</td>
+                          <td style={{ ...mono, fontSize: 11, padding: "4px 6px", textAlign: "right", borderBottom: `1px solid ${C.brd}22`, color: C.gdam }}>{r.agg.mktGDAM_MU}</td>
+                          <td style={{ ...mono, fontSize: 11, padding: "4px 6px", textAlign: "right", borderBottom: `1px solid ${C.brd}22`, color: C.rtm }}>{r.agg.mktRTM_MU}</td>
+                          <td style={{ ...mono, fontSize: 11, padding: "4px 6px", textAlign: "right", borderBottom: `1px solid ${C.brd}22`, fontWeight: 600 }}>{r.agg.mktMU}</td>
+                          <td style={{ ...mono, fontSize: 11, padding: "4px 6px", textAlign: "right", borderBottom: `1px solid ${C.brd}22`, color: C.pos }}>{r.agg.surMU}</td>
+                          <td style={{ ...mono, fontSize: 11, padding: "4px 6px", textAlign: "right", borderBottom: `1px solid ${C.brd}22` }}>{(+r.agg.mktMU - +r.agg.surMU).toFixed(1)}</td>
+                        </tr>
+                      ))}
+                      <tr style={{ borderTop: `2px solid ${C.brd}` }}>
+                        <td style={{ ...mono, fontSize: 11, padding: "4px 6px", fontWeight: 700 }}>ANNUAL</td>
+                        <td style={{ ...mono, fontSize: 11, padding: "4px 6px", textAlign: "right", fontWeight: 700, color: C.dam }}>{safeSum(all, r => +r.agg.mktDAM_MU).toFixed(1)}</td>
+                        <td style={{ ...mono, fontSize: 11, padding: "4px 6px", textAlign: "right", fontWeight: 700, color: C.gdam }}>{safeSum(all, r => +r.agg.mktGDAM_MU).toFixed(1)}</td>
+                        <td style={{ ...mono, fontSize: 11, padding: "4px 6px", textAlign: "right", fontWeight: 700, color: C.rtm }}>{safeSum(all, r => +r.agg.mktRTM_MU).toFixed(1)}</td>
+                        <td style={{ ...mono, fontSize: 11, padding: "4px 6px", textAlign: "right", fontWeight: 700 }}>{safeSum(all, r => +r.agg.mktMU).toFixed(1)}</td>
+                        <td style={{ ...mono, fontSize: 11, padding: "4px 6px", textAlign: "right", fontWeight: 700, color: C.pos }}>{safeSum(all, r => +r.agg.surMU).toFixed(1)}</td>
+                        <td style={{ ...mono, fontSize: 11, padding: "4px 6px", textAlign: "right", fontWeight: 700 }}>{(safeSum(all, r => +r.agg.mktMU) - safeSum(all, r => +r.agg.surMU)).toFixed(1)}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
               </Panel>
               <Panel title="ENERGY BALANCE" accent={C.pos}><AggView all={all} res={isAgg ? res : "monthly"} /></Panel>
             </div>
@@ -3728,8 +5010,12 @@ export default function App() {
 
           {tab === "scenarios" && (
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, background: C.panel, border: `1px solid ${C.brd}`, borderRadius: 2, padding: "6px 10px" }}>
+                <span style={{ ...lbl, fontSize: 10, color: C.t3 }}>Scenario parameters are configured in the</span>
+                <button onClick={() => setTab("config")} style={{ ...lbl, fontSize: 10, padding: "2px 8px", borderRadius: 2, border: `1px solid ${C.focus}44`, cursor: "pointer", background: C.focus + "12", color: C.focus, fontWeight: 600 }}>Configure</button>
+                <span style={{ ...lbl, fontSize: 10, color: C.t3 }}>tab</span>
+              </div>
               <Panel title="SCENARIO COMPARISON" accent={C.dec}><ScenarioCompare scenarioResults={scenarioResults} /></Panel>
-              <Panel title="SCENARIO PARAMETERS" accent={C.dec}><ScenarioEditor scenarios={scenarios} setScenarios={setScenarios} uploaded96={uploaded96} /></Panel>
             </div>
           )}
 
@@ -3784,21 +5070,25 @@ export default function App() {
               )}
             </div>
           )}
+          {tab === "uc" && (
+            <UCSimTab plants={plants} months={months} demand={demand} demandMU={demandMU} stoa={stoa} mkt={mkt} fdre={fdre} uploaded96={uploaded96} startMo={startMo} />
+          )}
         </div>
       </div>
 
       {/* ─── STATUS BAR ─── */}
-      <div style={{ minHeight: 26, flexShrink: 0, background: C.elev, borderTop: `1px solid ${C.brd}`, display: "flex", alignItems: "center", padding: "0 12px", gap: 12, zIndex: 50 }}>
-        <StatusDot color={C.pos} label="SCADA" />
-        <StatusDot color={C.pos} label="IEX" />
-        <StatusDot color={C.pos} label="SLDC" />
+      <div style={{ minHeight: 26, flexShrink: 0, background: C.elev, borderTop: `1px solid ${C.brd}`, display: "flex", alignItems: "center", padding: "0 12px", gap: 12, zIndex: 50, flexWrap: "wrap", overflow: "hidden", maxHeight: 52 }}>
+        <span style={{ ...lbl, fontSize: 10, color: dirty ? C.warn : C.pos, fontWeight: 600 }}>{dirty ? "INPUTS CHANGED — RUN DISPATCH" : "PLANNING MODE"}</span>
         <div style={{ width: 1, height: 12, background: C.brd }} />
         <span style={{ ...mono, fontSize: 10, color: C.t2 }}>TB <span style={{ color: C.val }}>{nowTB + 1}/96</span></span>
         <span style={{ ...mono, fontSize: 10, color: rpoData.recCost?.total > 0 ? C.warn : C.pos }}>
           RPO {(rpoData.totMU > 0 ? rpoData.fulfilled?.total / rpoData.totMU * 100 : 0).toFixed(1)}%
         </span>
         <span style={{ ...mono, fontSize: 10, color: C.t2 }}>{R.mo} | Pk {R.pk}MW | Rs{R.agg.avgCost}/kWh</span>
-        <span style={{ ...lbl, fontSize: 10, color: C.t2, marginLeft: "auto" }}>P-OPT OUTLOOK v5.9 | {plants.length} UNITS | {scenarios.filter(s => s.active).length} SCENARIOS</span>
+        <span style={{ ...mono, fontSize: 10, color: C.pos }}>COMPUTED {computedAt}</span>
+        <span style={{ ...lbl, fontSize: 10, color: C.t2, marginLeft: "auto" }}>P-OPT OUTLOOK v6.6 | {plants.length} UNITS | {scenarios.filter(s => s.active).length} SCENARIOS</span>
+        <div style={{ width: 1, height: 12, background: C.brd }} />
+        <span style={{ ...ui, fontSize: 9, color: C.t3 }}>Developed by <span style={{ color: C.focus, fontWeight: 600 }}>EMA Solutions Pvt. Ltd.</span> &copy; {new Date().getFullYear()} All rights reserved.</span>
       </div>
     </div>
   );
