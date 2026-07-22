@@ -1231,6 +1231,15 @@ const PAGE_INFO = {
       { heading: "Use Cases", text: "Test the impact of taking a large thermal offline for maintenance. Evaluate whether committing an expensive gas peaker saves money by reducing market exposure during peak hours. Assess the cost of must-running a plant for grid stability vs economic dispatch." },
     ],
   },
+  simulate_tb: {
+    title: "Simulate_TB",
+    sections: [
+      { heading: "Purpose", text: "Upload a daily block-wise demand profile for any period and run dispatch simulation for every individual day against the currently configured portfolio. Produces supply stack and supply-demand gap results exportable to Excel." },
+      { heading: "Input Format", text: "Timeseries XLSX — each row is a date, with 96 time-block columns (00:00 to 23:45) containing demand in MW. Also accepts the transposed format (dates as columns, blocks as rows). Download the template for the exact format." },
+      { heading: "How It Works", text: "For each uploaded day, the engine runs a full 96-block dispatch using that day's demand profile plus the current portfolio configuration (plants, STOA, FDRE, market prices from the Configure page). Market prices use the uploaded 96-block reference data for the corresponding calendar month." },
+      { heading: "Output", text: "Summary KPIs, monthly aggregation, and daily dispatch table showing peak demand, generation, market purchase, surplus, unserved energy, and cost for each day. Export produces a multi-sheet XLSX with daily summary, monthly summary, supply-by-source breakdown, and hourly gap matrix." },
+    ],
+  },
 };
 
 // InfoButton — small "i" icon that opens the help modal for the current tab
@@ -1293,6 +1302,7 @@ const NAV = [
   { id: "balance", label: "Balance", zone: "output", icon: "M12 3v10.55A4 4 0 1014 17V7h4V3h-6z" },
   { id: "banking", label: "Banking Sim", zone: "sim", icon: "M6.99 11L3 15l3.99 4v-3H14v-2H6.99v-3zM21 9l-3.99-4v3H10v2h7.01v3L21 9z" },
   { id: "uc", label: "UC Sim", zone: "sim", icon: "M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" },
+  { id: "simulate_tb", label: "Simulate_TB", zone: "sim", icon: "M3.5 18.49l6-6.01 4 4L22 6.92l-1.41-1.41-7.09 7.97-4-4L2 16.99z" },
 ];
 
 // ══════════════════════════════════════════════════════════════
@@ -4381,6 +4391,433 @@ function STOAEditor({ stoa, setStoa, moNames, months }) {
 }
 
 // ══════════════════════════════════════════════════════════════
+//  SIMULATE_TB — Upload daily demand → dispatch per day → export
+// ══════════════════════════════════════════════════════════════
+function ForecastTab({ plants, demand, demandMU, stoa, mkt, fdre, uploaded96 }) {
+  const FC_MAX_DAYS = 62;
+  const [fcData, setFcData] = useState(null);
+  const [fcResults, setFcResults] = useState(null);
+  const [running, setRunning] = useState(false);
+  const fileRef = useRef(null);
+
+  // Parse a cell as a date → YYYY-MM-DD string or null
+  const parseDate = useCallback((raw) => {
+    if (raw == null || raw === "") return null;
+    let dt;
+    if (typeof raw === "number") {
+      const d = XLSX.SSF.parse_date_code(raw);
+      if (d) dt = new Date(d.y, d.m - 1, d.d);
+    } else {
+      dt = new Date(String(raw));
+    }
+    if (dt && !isNaN(dt.getTime())) return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`;
+    return null;
+  }, []);
+
+  const handleUpload = useCallback((e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const wb = XLSX.read(ev.target.result, { type: "array" });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const aoa = XLSX.utils.sheet_to_json(ws, { header: 1 });
+        if (!aoa || aoa.length < 2) { alert("Empty or invalid file"); return; }
+
+        // Auto-detect format:
+        // Timeseries = dates in col 0 (rows), 96 block columns → many rows, ~97 cols
+        // Matrix     = dates in row 0 (cols), 96 block rows   → ~97 rows, many cols
+        const headerRow = aoa[0];
+        const firstColDate = aoa[1] ? parseDate(aoa[1][0]) : null;
+        const firstHeaderDate = headerRow.length > 1 ? parseDate(headerRow[1]) : null;
+        const isTimeseries = firstColDate && !firstHeaderDate;
+        // If ambiguous (both parse), use row count: timeseries has many rows (≥2 per day), matrix has ~97
+        const isBoth = firstColDate && firstHeaderDate;
+        const useTimeseries = isTimeseries || (isBoth && aoa.length > 100);
+
+        let dates = [], blocks = {};
+
+        if (useTimeseries) {
+          // Timeseries: Row 0 = header (Date, 00:00, 00:15, ...), Row 1+ = date + 96 MW values
+          const dayMap = {};
+          for (let r = 1; r < aoa.length; r++) {
+            const ds = parseDate(aoa[r][0]);
+            if (!ds) continue;
+            if (!dayMap[ds]) { dayMap[ds] = []; dates.push(ds); }
+            const mw = typeof aoa[r][1] === "number" ? Math.round(aoa[r][1]) : 0;
+            dayMap[ds].push(mw);
+          }
+          // If each date has exactly 1 row with 96 columns (wide timeseries)
+          if (dates.length > 0 && dayMap[dates[0]].length === 1 && aoa[1] && aoa[1].length >= 97) {
+            dates = []; const dayMap2 = {};
+            for (let r = 1; r < aoa.length; r++) {
+              const ds = parseDate(aoa[r][0]);
+              if (!ds) continue;
+              dates.push(ds);
+              const vals = [];
+              for (let c = 1; c <= 96; c++) { const v = aoa[r][c]; vals.push(typeof v === "number" ? Math.round(v) : 0); }
+              dayMap2[ds] = vals;
+            }
+            Object.assign(blocks, dayMap2);
+          } else {
+            // Long timeseries (multiple rows per date, one value per row)
+            dates.forEach(ds => {
+              const vals = dayMap[ds];
+              while (vals.length < 96) vals.push(vals[vals.length - 1] || 0);
+              blocks[ds] = vals.slice(0, 96);
+            });
+          }
+        } else {
+          // Matrix format: dates as column headers, 96 blocks as rows
+          const colDates = [];
+          for (let c = 1; c < headerRow.length; c++) {
+            const ds = parseDate(headerRow[c]);
+            if (ds) colDates.push({ col: c, dateStr: ds });
+          }
+          if (colDates.length === 0) { alert("No valid dates found in header row or first column"); return; }
+          const dataRows = aoa.slice(1);
+          const numBlocks = Math.min(dataRows.length, 96);
+          colDates.forEach(({ col, dateStr }) => {
+            const vals = [];
+            for (let r = 0; r < numBlocks; r++) {
+              const v = dataRows[r]?.[col];
+              vals.push(typeof v === "number" ? Math.round(v) : 0);
+            }
+            while (vals.length < 96) vals.push(vals[vals.length - 1] || 0);
+            blocks[dateStr] = vals;
+            dates.push(dateStr);
+          });
+        }
+
+        if (dates.length === 0) { alert("No valid date entries found"); return; }
+        // Cap at FC_MAX_DAYS
+        if (dates.length > FC_MAX_DAYS) {
+          alert(`Only the first ${FC_MAX_DAYS} days will be used (${dates.length} found). Maximum is 2 months / ${FC_MAX_DAYS} days.`);
+          dates = dates.slice(0, FC_MAX_DAYS);
+          const cappedBlocks = {};
+          dates.forEach(d => { cappedBlocks[d] = blocks[d]; });
+          blocks = cappedBlocks;
+        }
+        setFcData({ dates, blocks });
+        setFcResults(null);
+      } catch (err) { alert("Error parsing file: " + err.message); }
+    };
+    reader.readAsArrayBuffer(file);
+    e.target.value = "";
+  }, [parseDate]);
+
+  const runForecast = useCallback(() => {
+    if (!fcData) return;
+    setRunning(true);
+    setTimeout(() => {
+      const results = [];
+      fcData.dates.forEach((dateStr) => {
+        const dt = new Date(dateStr + "T00:00:00");
+        const calMo = dt.getMonth();
+        const dayBlocks = fcData.blocks[dateStr];
+        const pk = Math.max(...dayBlocks);
+        const blockData = { demand: { [calMo]: dayBlocks } };
+        ["dam", "rtm", "gdam"].forEach(key => {
+          if (uploaded96?.[key]?.[calMo]) blockData[key] = { [calMo]: uploaded96[key][calMo] };
+        });
+        const b96 = dispatch96(plants, pk, calMo, stoa, mkt, fdre, {}, calMo, 1, blockData, 0, demand[calMo]);
+        const agg = aggMonthly(b96, 1);
+        // Compute avg MW by supply segment for table display (sum before rounding to avoid ±3MW drift)
+        const rawDem = safeMean(b96, "dem");
+        const rawGen = safeMean(b96, "gen");
+        const rawFdre = safeMean(b96, b => b.fdreMW || 0);
+        const rawStoa = safeMean(b96, "stoaBuy");
+        const rawDAM = safeMean(b96, "mktDAM");
+        const rawGDAM = safeMean(b96, b => b.mktGDAM || 0);
+        const rawRTM = safeMean(b96, "mktRTM");
+        const rawSur = safeMean(b96, "sur");
+        const rawDef = safeMean(b96, "def");
+        const rawCurt = safeMean(b96, "curtailment");
+        const rawChg = safeMean(b96, b => b.chg || 0);
+        const avgDem = Math.round(rawDem), avgGen = Math.round(rawGen), avgFdre = Math.round(rawFdre);
+        const avgStoa = Math.round(rawStoa), avgDAM = Math.round(rawDAM), avgGDAM = Math.round(rawGDAM);
+        const avgRTM = Math.round(rawRTM), avgSur = Math.round(rawSur), avgDef = Math.round(rawDef);
+        const avgCurt = Math.round(rawCurt), avgChg = Math.round(rawChg);
+        // Own supply = contracted sources (excl. market). Gap = own supply - demand (negative = market-dependent).
+        const ownSupply = Math.round(rawGen + rawFdre + rawStoa);
+        const totalSupply = Math.round(rawGen + rawFdre + rawStoa + rawDAM + rawGDAM + rawRTM);
+        const netGap = Math.round(rawGen + rawFdre + rawStoa - rawDem);
+        results.push({ dateStr, calMo, pk, b96, agg,
+          dow: ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][dt.getDay()],
+          isWeekend: dt.getDay() === 0 || dt.getDay() === 6,
+          mw: { dem: avgDem, gen: avgGen, fdre: avgFdre, stoa: avgStoa, dam: avgDAM, gdam: avgGDAM, rtm: avgRTM, sur: avgSur, def: avgDef, curt: avgCurt, chg: avgChg, own: ownSupply, supply: totalSupply, gap: netGap },
+        });
+      });
+      setFcResults(results);
+      setRunning(false);
+    }, 50);
+  }, [fcData, plants, demand, stoa, mkt, fdre, uploaded96]);
+
+  const downloadTemplate = useCallback(() => {
+    const wb = XLSX.utils.book_new();
+    const today = new Date();
+    // Timeseries format: dates as rows, 96 time blocks as columns
+    const blockHeaders = [];
+    for (let t = 0; t < 96; t++) { const h = Math.floor(t / 4); const m = (t % 4) * 15; blockHeaders.push(`${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`); }
+    const rows = [["Date", ...blockHeaders]];
+    for (let i = 0; i < 30; i++) {
+      const d = new Date(today); d.setDate(d.getDate() + i + 1);
+      const ds = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      rows.push([ds, ...Array(96).fill("")]);
+    }
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), "Demand");
+    XLSX.writeFile(wb, "POPT_Outlook_SimulateTB_Template.xlsx");
+  }, []);
+
+  const unsOf = useCallback((agg) => Math.max(0, +(agg.defMU - (agg.mktDAM_MU || 0) - (agg.mktGDAM_MU || 0) - (agg.mktRTM_MU || 0)).toFixed(3)), []);
+
+  const exportResults = useCallback(() => {
+    if (!fcResults || fcResults.length === 0) return;
+    const wb = XLSX.utils.book_new();
+    // 1. Daily Supply-Demand & Gap (avg MW)
+    const sdg = [["Date", "Day", "Peak MW", "Avg Demand MW", "Own Gen MW", "FDRE MW", "STOA MW", "DAM MW", "GDAM MW", "RTM MW", "Total Supply MW", "Surplus MW", "Deficit MW", "Curtail MW", "Own−Dem Gap MW", "Demand MU", "Cost Cr", "Avg Rs/kWh"]];
+    fcResults.forEach(r => sdg.push([r.dateStr, r.dow, r.pk, r.mw.dem, r.mw.gen, r.mw.fdre, r.mw.stoa, r.mw.dam, r.mw.gdam, r.mw.rtm, r.mw.supply, r.mw.sur, r.mw.def, r.mw.curt, r.mw.gap, r.agg.demMU, r.agg.costCr, r.agg.avgCost]));
+    const totalCostCr = +(fcResults.reduce((s, r) => s + r.agg.costCr, 0)).toFixed(2);
+    const totalDemMU = +(fcResults.reduce((s, r) => s + r.agg.demMU, 0)).toFixed(1);
+    sdg.push(["TOTAL/AVG", "", Math.max(...fcResults.map(r => r.pk)),
+      Math.round(fcResults.reduce((s, r) => s + r.mw.dem, 0) / fcResults.length),
+      Math.round(fcResults.reduce((s, r) => s + r.mw.gen, 0) / fcResults.length),
+      Math.round(fcResults.reduce((s, r) => s + r.mw.fdre, 0) / fcResults.length),
+      Math.round(fcResults.reduce((s, r) => s + r.mw.stoa, 0) / fcResults.length),
+      Math.round(fcResults.reduce((s, r) => s + r.mw.dam, 0) / fcResults.length),
+      Math.round(fcResults.reduce((s, r) => s + r.mw.gdam, 0) / fcResults.length),
+      Math.round(fcResults.reduce((s, r) => s + r.mw.rtm, 0) / fcResults.length),
+      Math.round(fcResults.reduce((s, r) => s + r.mw.supply, 0) / fcResults.length),
+      Math.round(fcResults.reduce((s, r) => s + r.mw.sur, 0) / fcResults.length),
+      Math.round(fcResults.reduce((s, r) => s + r.mw.def, 0) / fcResults.length),
+      Math.round(fcResults.reduce((s, r) => s + r.mw.curt, 0) / fcResults.length),
+      Math.round(fcResults.reduce((s, r) => s + r.mw.gap, 0) / fcResults.length),
+      totalDemMU, totalCostCr, totalDemMU > 0 ? +(totalCostCr * 100 / (totalDemMU * 10)).toFixed(2) : 0]);
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(sdg), "Supply_Demand_Gap");
+    // 2. Monthly Summary (MU)
+    const moGroups = {};
+    fcResults.forEach(r => { const mk = r.dateStr.slice(0, 7); if (!moGroups[mk]) moGroups[mk] = []; moGroups[mk].push(r); });
+    const moSum = [["Month", "Days", "Peak MW", "Demand MU", "Own Gen MU", "FDRE MU", "STOA MU", "DAM MU", "GDAM MU", "RTM MU", "Surplus MU", "Unserved MU", "Curtail MU", "Cost Cr", "Avg Rs/kWh"]];
+    Object.keys(moGroups).sort().forEach(mk => {
+      const grp = moGroups[mk];
+      const demMU = +(grp.reduce((s, r) => s + r.agg.demMU, 0)).toFixed(1);
+      const costCr = +(grp.reduce((s, r) => s + r.agg.costCr, 0)).toFixed(2);
+      moSum.push([mk, grp.length, Math.max(...grp.map(r => r.pk)), demMU,
+        +(grp.reduce((s, r) => s + r.agg.genMU, 0)).toFixed(1),
+        +(grp.reduce((s, r) => s + (r.agg.fdreMU || 0), 0)).toFixed(1),
+        +(grp.reduce((s, r) => s + r.agg.stoaBuyMU, 0)).toFixed(1),
+        +(grp.reduce((s, r) => s + (r.agg.mktDAM_MU || 0), 0)).toFixed(1),
+        +(grp.reduce((s, r) => s + (r.agg.mktGDAM_MU || 0), 0)).toFixed(1),
+        +(grp.reduce((s, r) => s + (r.agg.mktRTM_MU || 0), 0)).toFixed(1),
+        +(grp.reduce((s, r) => s + r.agg.surMU, 0)).toFixed(1),
+        +(grp.reduce((s, r) => s + unsOf(r.agg), 0)).toFixed(1),
+        +(grp.reduce((s, r) => s + (r.agg.curtailMU || 0), 0)).toFixed(1),
+        costCr, demMU > 0 ? +(costCr * 100 / (demMU * 10)).toFixed(2) : 0]);
+    });
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(moSum), "Monthly_Summary");
+    // 3. Hourly Gap (date × 24h)
+    const gapRows = [["Date", ...Array.from({ length: 24 }, (_, h) => `${String(h).padStart(2, "0")}:00`)]];
+    fcResults.forEach(r => {
+      const row = [r.dateStr];
+      for (let h = 0; h < 24; h++) { const s = r.b96.slice(h * 4, h * 4 + 4); row.push(Math.round(safeMean(s, b => (b.sur || 0) - (b.def || 0)))); }
+      gapRows.push(row);
+    });
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(gapRows), "Hourly_Gap_MW");
+    // 4. Supply by Source (daily avg MW by plant type)
+    const plantSegs = SEG_ORDER.filter(s => !["Charging", "FDRE", "STOA", "DAM", "GDAM", "RTM"].includes(s));
+    const srcRows = [["Date", ...plantSegs, "FDRE", "STOA", "DAM", "GDAM", "RTM", "Demand"]];
+    fcResults.forEach(r => {
+      const bt = {};
+      Object.values(r.agg.srcE).forEach(s => { if (s.mw > 0 && plantSegs.includes(s.tp)) bt[s.tp] = (bt[s.tp] || 0) + s.mw; });
+      const row = [r.dateStr];
+      plantSegs.forEach(s => row.push(bt[s] || 0));
+      row.push(r.mw.fdre, r.mw.stoa, r.mw.dam, r.mw.gdam, r.mw.rtm, r.mw.dem);
+      srcRows.push(row);
+    });
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(srcRows), "Supply_By_Source_MW");
+    // 5. Meta
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([
+      ["P-OPT Outlook — Simulate_TB Results"],
+      ["Period", `${fcResults[0].dateStr} to ${fcResults[fcResults.length - 1].dateStr}`],
+      ["Days Dispatched", fcResults.length],
+      ["Portfolio", `${plants.length} plants, ${plants.filter(p => p.avail > 0).length} available`],
+      ["Note", "Dispatch uses currently configured portfolio (plants, STOA, FDRE, market prices)"],
+      ["Generated", new Date().toLocaleString()],
+    ]), "Meta");
+    const dateRange = `${fcResults[0].dateStr}_to_${fcResults[fcResults.length - 1].dateStr}`;
+    XLSX.writeFile(wb, `POPT_Outlook_SimulateTB_${dateRange}.xlsx`);
+  }, [fcResults, plants, unsOf]);
+
+  const summary = useMemo(() => {
+    if (!fcResults) return null;
+    const n = fcResults.length;
+    const totalDem = fcResults.reduce((s, r) => s + r.agg.demMU, 0);
+    const totalCost = fcResults.reduce((s, r) => s + r.agg.costCr, 0);
+    return {
+      days: n, peakMW: Math.max(...fcResults.map(r => r.pk)),
+      demMU: +totalDem.toFixed(1), genMU: +(fcResults.reduce((s, r) => s + r.agg.genMU, 0)).toFixed(1),
+      mktMU: +(fcResults.reduce((s, r) => s + r.agg.mktMU, 0)).toFixed(1),
+      surMU: +(fcResults.reduce((s, r) => s + r.agg.surMU, 0)).toFixed(1),
+      curtMU: +(fcResults.reduce((s, r) => s + (r.agg.curtailMU || 0), 0)).toFixed(1),
+      unsMU: +(fcResults.reduce((s, r) => s + unsOf(r.agg), 0)).toFixed(1),
+      costCr: +totalCost.toFixed(2),
+      avgCost: totalDem > 0 ? +(totalCost * 100 / (totalDem * 10)).toFixed(2) : 0,
+      // Avg MW for KPI bar
+      avgDemMW: Math.round(fcResults.reduce((s, r) => s + r.mw.dem, 0) / n),
+      avgSupplyMW: Math.round(fcResults.reduce((s, r) => s + r.mw.supply, 0) / n),
+      avgGapMW: Math.round(fcResults.reduce((s, r) => s + r.mw.gap, 0) / n),
+      avgDefMW: Math.round(fcResults.reduce((s, r) => s + r.mw.def, 0) / n),
+      avgSurMW: Math.round(fcResults.reduce((s, r) => s + r.mw.sur, 0) / n),
+    };
+  }, [fcResults, unsOf]);
+
+  const moAgg = useMemo(() => {
+    if (!fcResults) return [];
+    const groups = {};
+    fcResults.forEach(r => {
+      const mk = r.dateStr.slice(0, 7);
+      if (!groups[mk]) groups[mk] = { moKey: mk, calMo: r.calMo, days: 0, pk: 0, demMU: 0, genMU: 0, mktMU: 0, surMU: 0, unsMU: 0, curtMU: 0, costCr: 0 };
+      const g = groups[mk]; g.days++; g.pk = Math.max(g.pk, r.pk);
+      g.demMU += r.agg.demMU; g.genMU += r.agg.genMU; g.mktMU += r.agg.mktMU;
+      g.surMU += r.agg.surMU; g.curtMU += (r.agg.curtailMU || 0);
+      g.unsMU += unsOf(r.agg); g.costCr += r.agg.costCr;
+    });
+    return Object.values(groups).sort((a, b) => a.moKey.localeCompare(b.moKey)).map(g => ({
+      ...g, demMU: +g.demMU.toFixed(1), genMU: +g.genMU.toFixed(1), mktMU: +g.mktMU.toFixed(1),
+      surMU: +g.surMU.toFixed(1), unsMU: +g.unsMU.toFixed(1), curtMU: +g.curtMU.toFixed(1),
+      costCr: +g.costCr.toFixed(2), avgCost: g.demMU > 0 ? +(g.costCr * 100 / (g.demMU * 10)).toFixed(2) : 0,
+    }));
+  }, [fcResults, unsOf]);
+
+  const thS = { ...lbl, fontSize: 10, fontWeight: 700, color: C.t2, padding: "5px 6px", background: C.base, borderBottom: `1px solid ${C.brd}`, textAlign: "right", whiteSpace: "nowrap" };
+  const tdS = { ...mono, fontSize: 11, padding: "4px 6px", borderBottom: `1px solid ${C.brd}12`, textAlign: "right" };
+  const thGrp = (label, span, bg) => <th colSpan={span} style={{ ...lbl, fontSize: 9, fontWeight: 700, color: bg, padding: "3px 6px", background: C.base, borderBottom: `1px solid ${C.brd}`, textAlign: "center", letterSpacing: "0.06em" }}>{label}</th>;
+
+  return (
+    <div style={{ maxWidth: 1400, display: "flex", flexDirection: "column", gap: 10 }}>
+      <Panel title="SIMULATE_TB" accent={C.sim || "#AB47BC"}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
+          <button onClick={downloadTemplate} style={{ ...lbl, fontSize: 10, padding: "5px 12px", borderRadius: 3, border: `1px solid ${C.focus}44`, cursor: "pointer", background: C.focus + "12", color: C.focus, fontWeight: 600 }}>↓ DOWNLOAD TEMPLATE</button>
+          <button onClick={() => fileRef.current?.click()} style={{ ...lbl, fontSize: 10, padding: "5px 12px", borderRadius: 3, border: `1px solid ${C.pos}44`, cursor: "pointer", background: C.pos + "12", color: C.pos, fontWeight: 600 }}>↑ UPLOAD DEMAND XLSX</button>
+          <input ref={fileRef} type="file" accept=".xlsx,.xls" onChange={handleUpload} style={{ display: "none" }} />
+          {fcData && (
+            <>
+              <span style={{ ...mono, fontSize: 11, color: C.val }}>{fcData.dates.length} days loaded ({fcData.dates[0]} to {fcData.dates[fcData.dates.length - 1]})</span>
+              {fcData.dates.length > FC_MAX_DAYS && <span style={{ ...lbl, fontSize: 10, color: C.neg }}>CAPPED AT {FC_MAX_DAYS} DAYS</span>}
+              <button onClick={runForecast} disabled={running} style={{ ...lbl, fontSize: 11, padding: "5px 16px", borderRadius: 3, cursor: running ? "wait" : "pointer", fontWeight: 700, letterSpacing: 1, background: C.focus, color: "#fff", border: `1px solid ${C.focus}`, boxShadow: `0 0 8px ${C.focus}44`, opacity: running ? 0.6 : 1 }}>
+                {running ? "SIMULATING..." : "▶ RUN SIMULATION"}
+              </button>
+              <button onClick={() => { setFcData(null); setFcResults(null); }} style={{ ...lbl, fontSize: 10, padding: "4px 10px", borderRadius: 2, border: `1px solid ${C.neg}44`, cursor: "pointer", background: C.neg + "12", color: C.neg }}>CLEAR</button>
+            </>
+          )}
+        </div>
+        {!fcData && (
+          <div style={{ ...ui, fontSize: 11, color: C.t3, padding: "12px 16px", background: C.overlay, borderRadius: 6, border: `1px solid ${C.brd}`, lineHeight: 1.6 }}>
+            <strong style={{ color: C.t2 }}>Format:</strong> Timeseries XLSX — each row is a date, 96 time-block columns (00:00 to 23:45) with demand MW values. Max {FC_MAX_DAYS} days (2 months). Download the template for the exact format. Uses the currently configured portfolio for dispatch.
+          </div>
+        )}
+      </Panel>
+
+      {fcResults && summary && (
+        <>
+          {/* KPI indicators */}
+          <Panel title={`SUMMARY — ${summary.days} DAYS`} accent={C.pos}>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+              <KPI label="PEAK DEMAND" value={`${summary.peakMW}`} unit="MW" color={C.warn} accent={C.warn} />
+              <KPI label="AVG DEMAND" value={`${summary.avgDemMW}`} unit="MW" color={C.t1} accent={C.t1} sub={`${summary.demMU} MU`} />
+              <KPI label="OWN SUPPLY" value={`${Math.round(fcResults.reduce((s, r) => s + r.mw.own, 0) / fcResults.length)}`} unit="MW" color={C.pos} accent={C.pos} sub={`Gen ${summary.genMU} MU`} />
+              <KPI label="MARKET" value={`${summary.mktMU}`} unit="MU" color={C.focus} accent={C.focus} />
+              <KPI label="OWN−DEM GAP" value={`${summary.avgGapMW >= 0 ? "+" : ""}${summary.avgGapMW}`} unit="MW" color={summary.avgGapMW >= 0 ? C.pos : C.neg} accent={summary.avgGapMW >= 0 ? C.pos : C.neg} sub={summary.avgGapMW >= 0 ? "Own surplus" : "Market dependent"} />
+              <KPI label="UNSERVED" value={`${summary.unsMU}`} unit="MU" color={summary.unsMU > 0 ? C.neg : C.pos} accent={summary.unsMU > 0 ? C.neg : C.pos} />
+              <KPI label="COST" value={`₹${summary.costCr}`} unit="Cr" color={C.warn} accent={C.warn} />
+              <KPI label="AVG COST" value={`₹${summary.avgCost}`} unit="/kWh" color={C.val} accent={C.val} />
+            </div>
+            <button onClick={exportResults} style={{ ...lbl, fontSize: 10, padding: "5px 14px", borderRadius: 3, border: `1px solid ${C.pos}44`, cursor: "pointer", background: C.pos + "15", color: C.pos, fontWeight: 600 }}>⬇ EXPORT XLSX</button>
+          </Panel>
+
+          {/* Monthly breakdown */}
+          {moAgg.length > 1 && (
+            <Panel title="MONTHLY BREAKDOWN">
+              <div style={{ overflow: "auto", border: `1px solid ${C.brd}`, borderRadius: 6 }}>
+                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                  <thead><tr>{["Month", "Days", "Peak MW", "Demand MU", "Gen MU", "Market MU", "Surplus MU", "Unserved MU", "Curtail MU", "Cost Cr", "Rs/kWh"].map((h, i) => <th key={i} style={{ ...thS, textAlign: i === 0 ? "left" : "right" }}>{h}</th>)}</tr></thead>
+                  <tbody>{moAgg.map(g => (
+                    <tr key={g.moKey}>
+                      <td style={{ ...tdS, textAlign: "left", color: C.t1, fontWeight: 600 }}>{CAL_MO[g.calMo]} {g.moKey.slice(0, 4)}</td>
+                      <td style={tdS}>{g.days}</td>
+                      <td style={{ ...tdS, color: C.warn }}>{g.pk}</td>
+                      <td style={tdS}>{g.demMU}</td>
+                      <td style={{ ...tdS, color: C.pos }}>{g.genMU}</td>
+                      <td style={{ ...tdS, color: C.focus }}>{g.mktMU}</td>
+                      <td style={{ ...tdS, color: C.bilat }}>{g.surMU}</td>
+                      <td style={{ ...tdS, color: g.unsMU > 0 ? C.neg : C.t2 }}>{g.unsMU.toFixed(1)}</td>
+                      <td style={{ ...tdS, color: g.curtMU > 0 ? C.neg : C.t2 }}>{g.curtMU.toFixed(1)}</td>
+                      <td style={{ ...tdS, color: C.warn }}>{g.costCr}</td>
+                      <td style={{ ...tdS, color: C.val }}>{g.avgCost}</td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              </div>
+            </Panel>
+          )}
+
+          {/* Supply-Demand & Gap table (avg MW per day) */}
+          <Panel title="SUPPLY-DEMAND & GAP (AVG MW)">
+            <div style={{ overflow: "auto", maxHeight: 560, border: `1px solid ${C.brd}`, borderRadius: 6 }}>
+              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                <thead style={{ position: "sticky", top: 0, zIndex: 3 }}>
+                  <tr style={{ background: C.base }}>
+                    <th colSpan={3} style={{ ...thS, textAlign: "left", borderRight: `1px solid ${C.brd}` }}></th>
+                    {thGrp("DEMAND", 1, C.warn)}
+                    {thGrp("—— OWN SUPPLY ——", 3, C.pos)}
+                    {thGrp("—— MARKET ——", 3, C.focus)}
+                    {thGrp("TOTAL", 1, C.t1)}
+                    {thGrp("—— GAP (Own−Dem) ——", 4, C.neg)}
+                    {thGrp("COST", 2, C.val)}
+                  </tr>
+                  <tr>
+                    {["Date", "Day", "Peak", "Dem", "Gen", "FDRE", "STOA", "DAM", "GDAM", "RTM", "Total", "Surplus", "Deficit", "Curtail", "Gap", "Cr", "Rs/kWh"].map((h, i) => (
+                      <th key={i} style={{ ...thS, textAlign: i < 2 ? "left" : "right",
+                        borderRight: (i === 2 || i === 3 || i === 6 || i === 9 || i === 10 || i === 14) ? `1px solid ${C.brd}44` : "none",
+                      }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>{fcResults.map(r => (
+                  <tr key={r.dateStr} style={{ background: r.isWeekend ? C.overlay : "transparent" }}>
+                    <td style={{ ...tdS, textAlign: "left", color: C.t1 }}>{r.dateStr}</td>
+                    <td style={{ ...tdS, textAlign: "left", color: r.isWeekend ? C.warn : C.t2, fontSize: 10 }}>{r.dow}</td>
+                    <td style={{ ...tdS, color: C.warn, borderRight: `1px solid ${C.brd}44` }}>{r.pk}</td>
+                    <td style={{ ...tdS, color: C.t1, fontWeight: 600, borderRight: `1px solid ${C.brd}44` }}>{r.mw.dem}</td>
+                    <td style={{ ...tdS, color: C.pos }}>{r.mw.gen}</td>
+                    <td style={{ ...tdS, color: C.t2 }}>{r.mw.fdre || "—"}</td>
+                    <td style={{ ...tdS, color: C.bilat, borderRight: `1px solid ${C.brd}44` }}>{r.mw.stoa || "—"}</td>
+                    <td style={{ ...tdS, color: C.focus }}>{r.mw.dam}</td>
+                    <td style={{ ...tdS, color: C.t2 }}>{r.mw.gdam || "—"}</td>
+                    <td style={{ ...tdS, color: C.t2, borderRight: `1px solid ${C.brd}44` }}>{r.mw.rtm}</td>
+                    <td style={{ ...tdS, color: C.pos, fontWeight: 600, borderRight: `1px solid ${C.brd}44` }}>{r.mw.supply}</td>
+                    <td style={{ ...tdS, color: r.mw.sur > 0 ? C.bilat : C.t3 }}>{r.mw.sur || "—"}</td>
+                    <td style={{ ...tdS, color: r.mw.def > 0 ? C.neg : C.t3 }}>{r.mw.def || "—"}</td>
+                    <td style={{ ...tdS, color: r.mw.curt > 0 ? C.neg : C.t3 }}>{r.mw.curt || "—"}</td>
+                    <td style={{ ...tdS, fontWeight: 600, borderRight: `1px solid ${C.brd}44`,
+                      color: r.mw.gap > 0 ? C.pos : r.mw.gap < 0 ? C.neg : C.t2,
+                      background: r.mw.gap < -50 ? C.neg + "12" : r.mw.gap > 50 ? C.pos + "08" : "transparent",
+                    }}>{r.mw.gap > 0 ? "+" : ""}{r.mw.gap}</td>
+                    <td style={{ ...tdS, color: C.warn }}>{r.agg.costCr}</td>
+                    <td style={{ ...tdS, color: C.val }}>{r.agg.avgCost}</td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+          </Panel>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
 //  MAIN APP — PROFESSIONAL LAYOUT
 // ══════════════════════════════════════════════════════════════
 export default function App() {
@@ -5073,6 +5510,9 @@ export default function App() {
           {tab === "uc" && (
             <UCSimTab plants={plants} months={months} demand={demand} demandMU={demandMU} stoa={stoa} mkt={mkt} fdre={fdre} uploaded96={uploaded96} startMo={startMo} />
           )}
+          {tab === "simulate_tb" && (
+            <ForecastTab plants={plants} demand={demand} demandMU={demandMU} stoa={stoa} mkt={mkt} fdre={fdre} uploaded96={uploaded96} />
+          )}
         </div>
       </div>
 
@@ -5086,7 +5526,7 @@ export default function App() {
         </span>
         <span style={{ ...mono, fontSize: 10, color: C.t2 }}>{R.mo} | Pk {R.pk}MW | Rs{R.agg.avgCost}/kWh</span>
         <span style={{ ...mono, fontSize: 10, color: C.pos }}>COMPUTED {computedAt}</span>
-        <span style={{ ...lbl, fontSize: 10, color: C.t2, marginLeft: "auto" }}>P-OPT OUTLOOK v6.6 | {plants.length} UNITS | {scenarios.filter(s => s.active).length} SCENARIOS</span>
+        <span style={{ ...lbl, fontSize: 10, color: C.t2, marginLeft: "auto" }}>P-OPT OUTLOOK v6.8 | {plants.length} UNITS | {scenarios.filter(s => s.active).length} SCENARIOS</span>
         <div style={{ width: 1, height: 12, background: C.brd }} />
         <span style={{ ...ui, fontSize: 9, color: C.t3 }}>Developed by <span style={{ color: C.focus, fontWeight: 600 }}>EMA Solutions Pvt. Ltd.</span> &copy; {new Date().getFullYear()} All rights reserved.</span>
       </div>
