@@ -4718,7 +4718,16 @@ function ForecastTab({ plants, demand, demandMU, stoa, mkt, fdre, uploaded96 }) 
       });
     });
     XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(blkRows), "Block_Dispatch_96");
-    // 6. Meta
+    // 6. Plant-wise dispatch (96 blocks × all days — one column per plant, excludes market/STOA)
+    const ownPlants = plants.filter(p => p.pMax > 0);
+    const pRows = [["Date", "Day", "Block", ...ownPlants.map(p => p.name)]];
+    fcResults.forEach(r => {
+      r.b96.forEach((b, t) => {
+        pRows.push([r.dateStr, r.dow, TB[t].lbl, ...ownPlants.map(p => Math.round(b.src?.[p.id]?.mw || 0))]);
+      });
+    });
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(pRows), "Plant_Dispatch_96");
+    // 7. Meta
     XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([
       ["P-OPT Outlook — Simulate_TB Results"],
       ["Period", `${fcResults[0].dateStr} to ${fcResults[fcResults.length - 1].dateStr}`],
